@@ -259,6 +259,9 @@ _SPECS = [
     _cmd("claim", [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
+        _arg("--external", action="store_true",
+             help="Interactive-operator hold: no TTL, never auto-reclaimed; "
+                  "release only via complete/block/reclaim"),
     ], help="Atomically claim a ready task (prints resolved workspace path)"),
     _cmd("comment", [
         _TASK_ID,

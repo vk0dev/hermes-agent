@@ -276,6 +276,26 @@ DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 # under memory.high, SIGKILL pending): releasing now would spawn a duplicate.
 RECLAIM_DEFER_GRACE_SECONDS = 120
 
+# ``tasks.claim_kind`` discriminates *who* holds a claim:
+#   * ``worker``   — a dispatcher-spawned worker subprocess, subject to the
+#     full reclaim machinery (TTL expiry, PID-liveness, heartbeat-staleness,
+#     max-runtime) so a dead/wedged worker frees its task.
+#   * ``external`` — a live interactive operator session (e.g. a Claude Code
+#     session that ran ``hermes kanban claim --external``). Such sessions emit
+#     no kanban heartbeats, so their TTL/heartbeat would protrude exactly like
+#     a wedged worker. To stop the dispatcher from re-dispatching a task a
+#     human is actively working on (the t_0781f106 parallel-work incident), an
+#     external claim is held *indefinitely* (``claim_expires = NULL``,
+#     ``worker_pid = NULL``) and is therefore invisible to the reclaimers
+#     (``release_stale_claims`` filters ``claim_expires IS NOT NULL``;
+#     ``enforce_max_runtime`` and the crashed-worker sweep filter
+#     ``worker_pid IS NOT NULL``; ``detect_stale_running`` guards on this
+#     column explicitly). Released only by explicit complete/block/reclaim.
+# A NULL ``claim_kind`` (legacy rows, pre-migration boards) is treated as
+# ``worker`` everywhere so the historical behaviour is preserved.
+CLAIM_KIND_WORKER = "worker"
+CLAIM_KIND_EXTERNAL = "external"
+
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     """Explicit ``ttl_seconds`` > ``HERMES_KANBAN_CLAIM_TTL_SECONDS`` > default."""
@@ -689,6 +709,9 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    # 'worker' | 'external' | None. None == legacy/worker. An 'external'
+    # claim is a live interactive operator hold and is never auto-reclaimed.
+    claim_kind: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Column semantics: see SCHEMA_SQL.
@@ -742,7 +765,7 @@ _TASK_REQUIRED_COLUMNS = (
 )
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
-    "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
+    "branch_name", "project_id", "claim_kind", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
 )
@@ -869,6 +892,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     project_id           TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
+    -- Who holds the claim: 'worker' (dispatcher-spawned, fully reclaimable)
+    -- or 'external' (live interactive operator session, held indefinitely
+    -- and never auto-reclaimed). NULL = legacy/worker. See CLAIM_KIND_*.
+    claim_kind           TEXT,
     tenant               TEXT,
     result               TEXT,
     idempotency_key      TEXT,
@@ -2076,23 +2103,26 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def _claim_and_open_run(
-    conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
+    conn: sqlite3.Connection, task_id: str, source_status: str, lock: str,
+    expires: Optional[int], now: int,
+    *, kind: str = CLAIM_KIND_WORKER, event_extra: Optional[dict] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
+    when the CAS lost. Caller holds the txn. ``expires=None`` + ``kind=
+    CLAIM_KIND_EXTERNAL`` is an indefinite interactive-operator hold."""
     cur = conn.execute(
         f"""
         UPDATE tasks
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
+               claim_kind    = ?,
                started_at    = COALESCE(started_at, ?)
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
         """,
-        (lock, expires, now, task_id),
+        (lock, expires, kind, now, task_id),
     )
     if cur.rowcount != 1:
         return None
@@ -2117,23 +2147,34 @@ def _claim_and_open_run(
     conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
     _append_event(
         conn, task_id, "claimed",
-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
+        {"lock": lock, "expires": expires, "run_id": run_id, "kind": kind,
+         **(event_extra or {})}, run_id=run_id,
     )
     return run_id
 
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, external: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
+
+    ``external=True`` marks the claim as a live interactive-operator hold
+    (``claim_kind = 'external'``). Such a claim is held *indefinitely*
+    (``claim_expires = NULL``) and is never auto-reclaimed by the
+    dispatcher's stale/crash/runtime sweeps — only an explicit
+    ``complete`` / ``block`` / ``reclaim`` releases it. ``ttl_seconds`` is
+    ignored for external claims. See CLAIM_KIND_EXTERNAL.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    # External (interactive) holds never expire — a NULL ``claim_expires``
+    # also keeps the row out of ``release_stale_claims``'s candidate SELECT.
+    expires = None if external else now + _resolve_claim_ttl_seconds(ttl_seconds)
+    kind = CLAIM_KIND_EXTERNAL if external else CLAIM_KIND_WORKER
     with write_txn(conn):
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
@@ -2149,7 +2190,7 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now, kind=kind)
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -2292,14 +2333,23 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
     now = int(time.time())
     reclaimed = 0
     host_prefix = _host_prefix()
+    # External (interactive-operator) holds are never auto-reclaimed:
+    # ``claim_task(external=True)`` sets ``claim_expires = NULL`` (so these
+    # rows can't match the filter below), and we also guard on ``claim_kind``
+    # explicitly as defense-in-depth in case a future code path stamps an
+    # expiry on an external claim. See CLAIM_KIND_EXTERNAL.
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
+        "SELECT id, claim_lock, claim_kind, worker_pid, claim_expires, last_heartbeat_at, "
         "       assignee "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?", (now,),
+        "  AND claim_expires < ? "
+        "  AND (claim_kind IS NULL OR claim_kind != ?)", (now, CLAIM_KIND_EXTERNAL),
     ).fetchall()
     for row in stale:
+        if row["claim_kind"] == CLAIM_KIND_EXTERNAL:
+            # Unreachable under the SELECT above; belt-and-suspenders.
+            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
@@ -2323,7 +2373,7 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires = NULL, claim_kind = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
                 (retry_status, row["id"], row["claim_lock"], now),
@@ -2415,9 +2465,12 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(row["worker_pid"], prev_lock, signal_fn=signal_fn)
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
+        # Clear claim_kind too: an operator reclaim is the explicit recovery
+        # path for an external hold whose interactive session died without
+        # complete/block; the task returns to a clean worker-claimable state.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL "
+            "claim_expires = NULL, claim_kind = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
         )
@@ -2565,6 +2618,7 @@ def complete_task(
                        completed_at = ?,
                        claim_lock   = NULL,
                        claim_expires= NULL,
+                       claim_kind   = NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
                        block_recurrences = 0
@@ -2923,6 +2977,7 @@ def block_task(
                    SET status        = '{new_status}',
                        claim_lock    = NULL,
                        claim_expires = NULL,
+                       claim_kind    = NULL,
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?

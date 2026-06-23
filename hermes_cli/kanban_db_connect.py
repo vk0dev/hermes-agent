@@ -809,6 +809,9 @@ _LATER_TASK_COLUMNS = (
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
+    # Who holds the claim: 'worker' (fully reclaimable) or 'external'
+    # (interactive operator hold, never auto-reclaimed). See CLAIM_KIND_*.
+    ("claim_kind", "claim_kind TEXT"),
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),

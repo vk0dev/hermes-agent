@@ -528,15 +528,23 @@ def detect_stale_running(
     now = int(time.time())
     reclaimed: list[str] = []
 
+    # External (interactive-operator) holds emit no heartbeats by design and
+    # must never be swept as "stale running" — that would re-open the
+    # t_0781f106 parallel-dispatch incident via this newer code path.
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.claim_kind, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.status = 'running' "
+        "  AND (t.claim_kind IS NULL OR t.claim_kind != 'external')"
     ).fetchall()
 
     for row in rows:
+        if row["claim_kind"] == "external":
+            # Unreachable under the SELECT above; belt-and-suspenders.
+            continue
         if row["active_started_at"] is None:
             continue
         elapsed = now - int(row["active_started_at"])

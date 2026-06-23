@@ -710,8 +710,14 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    external = bool(getattr(args, "external", False))
     with kbc.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        task = kb.claim_task(
+            conn, args.task_id,
+            # TTL is meaningless for an external (never-expiring) hold.
+            ttl_seconds=None if external else args.ttl,
+            external=external,
+        )
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
@@ -720,7 +726,12 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                         f"lock={existing.claim_lock or '(none)'}")
         workspace = kbw.resolve_workspace(task)
         kbw.set_workspace_path(conn, task.id, str(workspace))
-    print(f"Claimed {task.id}\nWorkspace: {workspace}")
+    if external:
+        print(f"Claimed {task.id} (external hold — no TTL, dispatcher will not reclaim)\n"
+              f"Release with: hermes kanban complete/block/reclaim {task.id}\n"
+              f"Workspace: {workspace}")
+    else:
+        print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
 
 
