@@ -96,3 +96,117 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     )
 
 
+def test_cli_invalid_max_in_progress_silently_disables(isolated_kanban_home, monkeypatch):
+    """Invalid kanban.max_in_progress values (0, negative, non-int) should
+    silently fall through to None — no crash, no surprise behavior."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    for bad_val in (0, -1, "abc", "1.5"):
+        fake_config = {"kanban": {"max_in_progress": bad_val}}
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+        captured = {}
+        monkeypatch.setattr(
+            kanban_db, "dispatch_once",
+            lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
+        )
+        args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+        kb_cli._cmd_dispatch(args)
+        assert captured.get("max_in_progress") is None, (
+            f"invalid max_in_progress={bad_val!r} should fall through to None, "
+            f"got {captured.get('max_in_progress')!r}"
+        )
+
+
+def test_kanban_swarm_uses_existing_humanizer_skill():
+    """#29415: kanban_swarm.py used to hardcode skills=['avoid-ai-writing'],
+    a skill that doesn't exist in any registry — synthesizer workers
+    crashed with 'Unknown skill(s): avoid-ai-writing' on every retry.
+
+    Verify the synthesizer card now uses the bundled 'humanizer' skill
+    which actually exists at skills/creative/humanizer/SKILL.md."""
+    import pathlib
+
+    swarm_path = (
+        pathlib.Path(__file__).resolve().parent.parent.parent
+        / "hermes_cli" / "kanban_swarm.py"
+    )
+    src = swarm_path.read_text()
+    assert "avoid-ai-writing" not in src, (
+        "kanban_swarm.py must not reference 'avoid-ai-writing' — that "
+        "skill doesn't exist in any registry, crashing synthesizers (#29415)"
+    )
+    assert '"humanizer"' in src, (
+        "kanban_swarm.py should use the bundled 'humanizer' skill for "
+        "synthesizer cards (the original intent of 'avoid-ai-writing')"
+    )
+
+    # And the replacement skill must actually exist on disk.
+    skills_root = (
+        pathlib.Path(__file__).resolve().parent.parent.parent / "skills"
+    )
+    humanizer_path = skills_root / "creative" / "humanizer" / "SKILL.md"
+    assert humanizer_path.is_file(), (
+        f"humanizer skill missing at {humanizer_path}; the kanban_swarm fix "
+        "for #29415 requires this bundled skill to exist"
+    )
+
+
+def test_cli_claim_external_flag_sets_external_kind(isolated_kanban_home):
+    """``hermes kanban claim <id> --external`` must mark the claim as an
+    external (interactive-operator) hold so the dispatcher never spawns a
+    parallel worker on a task a live ccz/ccp session is working."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    kanban_db.init_db()
+    with kanban_db.connect() as conn:
+        tid = kanban_db.create_task(conn, title="live work", assignee="a")
+
+    args = SimpleNamespace(
+        task_id=tid, ttl=kanban_db.DEFAULT_CLAIM_TTL_SECONDS, external=True,
+    )
+    rc = kb_cli._cmd_claim(args)
+    assert rc == 0
+
+    with kanban_db.connect() as conn:
+        task = kanban_db.get_task(conn, tid)
+    assert task.status == "running"
+    assert task.claim_kind == kanban_db.CLAIM_KIND_EXTERNAL
+    assert task.claim_expires is None
+
+
+def test_cli_claim_without_external_is_worker(isolated_kanban_home):
+    """The default CLI claim path is unchanged: a worker claim with a TTL."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    kanban_db.init_db()
+    with kanban_db.connect() as conn:
+        tid = kanban_db.create_task(conn, title="work", assignee="a")
+
+    args = SimpleNamespace(
+        task_id=tid, ttl=kanban_db.DEFAULT_CLAIM_TTL_SECONDS, external=False,
+    )
+    rc = kb_cli._cmd_claim(args)
+    assert rc == 0
+
+    with kanban_db.connect() as conn:
+        task = kanban_db.get_task(conn, tid)
+    assert task.claim_kind == kanban_db.CLAIM_KIND_WORKER
+    assert task.claim_expires is not None
+
+
+def test_cli_claim_parser_accepts_external_flag(isolated_kanban_home):
+    """The argparse surface must expose ``--external`` on the claim
+    subcommand (CLI contract)."""
+    import argparse
+    from hermes_cli import kanban as kb_cli
+
+    top = argparse.ArgumentParser()
+    top_sub = top.add_subparsers(dest="top_cmd")
+    kb_cli.build_parser(top_sub)
+    ns = top.parse_args(["kanban", "claim", "t_abc", "--external"])
+    assert ns.external is True
+    ns2 = top.parse_args(["kanban", "claim", "t_abc"])
+    assert ns2.external is False
