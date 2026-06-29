@@ -26,6 +26,18 @@ DEFAULT_CONFIG = {
     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
     # of switching the turn to a fallback model.
     "fallback": {"min_switch_reset_seconds": 0},
+    # Circuit breaker for paid fallback providers during primary-model outages.
+    # When enabled, caps metered (non-:free) fallback activations within a rolling
+    # window. Once the cap is reached, subsequent requests skip the metered entry
+    # and advance to the next (free) fallback in the chain. An alert fires once per
+    # outage window. Disabled by default; enable in config.yaml to activate.
+    "fallback_circuit_breaker": {
+        "enabled": False,
+        "paid_call_cap": 50,
+        "window_seconds": 3600,
+        "state_file": "",
+        "alert_target": "",
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # journal_mode: SQLite journal mode for every Hermes DB. "wal" default; use "delete" on
