@@ -1841,6 +1841,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
+        # Paid-GLM circuit breaker: cap metered fallback calls during outage windows.
+        # Fail-open: any breaker error is caught inside breaker_gate — fallback proceeds.
+        # Only reached on failover so the codex-up path is byte-identical.
+        try:
+            from agent.fallback_breaker import breaker_gate as _breaker_gate
+            _breaker_allowed, _breaker_just_opened = _breaker_gate(agent, fb)
+            if not _breaker_allowed:
+                logger.info(
+                    "Fallback circuit breaker: skipping metered %s/%s (cap reached)",
+                    fb_provider, fb_model,
+                )
+                continue  # advance to next entry → free llama
+        except Exception as _brk_err:
+            logger.warning("fallback_breaker: import/call error (fail-open): %s", _brk_err)
+
         try:
             from agent.auxiliary_client import resolve_provider_client
             from hermes_cli.fallback_config import resolve_entry_api_key
