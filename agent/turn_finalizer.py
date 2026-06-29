@@ -598,6 +598,15 @@ def finalize_turn(
     if _should_review_skills:
         agent._iters_since_skill = 0
 
+    # Check reflect-distill trigger — turn-based cadence.
+    _should_review_reflect = False
+    _reflect_interval = getattr(agent, "_reflect_nudge_interval", 0)
+    if _reflect_interval > 0:
+        agent._turns_since_reflect = getattr(agent, "_turns_since_reflect", 0) + 1
+        if agent._turns_since_reflect >= _reflect_interval:
+            _should_review_reflect = True
+            agent._turns_since_reflect = 0
+
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message, final_response=final_response,
@@ -612,12 +621,13 @@ def finalize_turn(
         final_response
         and not interrupted
         and not getattr(agent, "skip_background_review", False)
-        and (_should_review_memory or _should_review_skills)
+        and (_should_review_memory or _should_review_skills or _should_review_reflect)
     ):
         with suppress(Exception):
             agent._spawn_background_review(
                 messages_snapshot=list(messages), review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
+                review_reflect=_should_review_reflect,
             )
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:

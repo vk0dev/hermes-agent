@@ -122,6 +122,12 @@ TOOLSETS = {
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+    "reflect": _ts(
+        "Reflect & distill: append first-person reflections to SELF.md "
+        "and record durable world/person/project facts to long-term memory. "
+        "Used exclusively by the background reflect-review fork (B1.2).",
+        ["append_reflection", "record_fact"],
+    ),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),

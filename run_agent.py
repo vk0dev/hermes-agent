@@ -735,7 +735,8 @@ class AIAgent(
     _summarize_background_review_actions = _forward_static("agent.background_review", "summarize_background_review_actions")
 
     def _spawn_background_review(self, messages_snapshot: List[Dict], review_memory: bool = False,
-                                 review_skills: bool = False, focus: Optional[str] = None, explicit: bool = False) -> None:
+                                 review_skills: bool = False, focus: Optional[str] = None, explicit: bool = False,
+                                 review_reflect: bool = False) -> None:
         """Post-turn review entry point: decide WHEN, then spawn.
 
         A review whose runtime is the MANAGED LOCAL llama-server is queued for machine idle (``defer: auto``)
@@ -758,7 +759,8 @@ class AIAgent(
         # deferral) goes through. See #100795.
         from agent.turn_finalizer import _clone_background_review_messages
         kwargs = dict(messages_snapshot=_clone_background_review_messages(messages_snapshot),
-                      review_memory=review_memory, review_skills=review_skills, focus=focus, task_cfg=task_cfg)
+                      review_memory=review_memory, review_skills=review_skills, focus=focus, task_cfg=task_cfg,
+                      review_reflect=review_reflect)
         if focus is None and not explicit and _review_should_defer(self, task_cfg):
             from agent.review_idle_queue import QUEUE
             QUEUE.enqueue(self, _review_queue_key(self), kwargs)
@@ -767,39 +769,55 @@ class AIAgent(
 
     def _spawn_background_review_now(self, messages_snapshot: List[Dict], review_memory: bool = False,
                                      review_skills: bool = False, focus: Optional[str] = None,
-                                     task_cfg: Optional[Dict[str, Any]] = None, _requeue_attempts: int = 0) -> None:
-        """Spawn the background memory/skill review thread.
+                                     task_cfg: Optional[Dict[str, Any]] = None, _requeue_attempts: int = 0,
+                                     review_reflect: bool = False) -> None:
+        """Spawn the background memory/skill/reflect review thread(s).
 
         ``threading.Thread`` is constructed here so tests patching ``run_agent.threading.Thread`` keep working.
         ``focus`` is /refine steering text; ``task_cfg`` is the pre-loaded config block (None on direct calls).
         A deferred review preempted by a live turn is requeued (bounded) rather than lost.
+        The reflect axis runs in its own ``bg-reflect`` thread independent of the memory/skills
+        ``bg-review`` thread so both can co-fire.
         """
         from agent.background_review import (
             finish_background_review_run, prepare_background_review_run, spawn_background_review_thread,
         )
         from tools.thread_context import propagate_context_to_thread
 
-        review_run = prepare_background_review_run(self)
-        if review_run is None:
-            return
-        try:
-            target, _prompt = spawn_background_review_thread(
-                self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
-                focus=focus, task_cfg=task_cfg, review_run=review_run,
+        # bg-review spawns for every legacy call shape (incl. /refine with both flags False);
+        # it is skipped only when the ONLY requested axis is reflect.
+        if review_memory or review_skills or focus is not None or not review_reflect:
+            review_run = prepare_background_review_run(self)
+            if review_run is None:
+                return
+            try:
+                target, _prompt = spawn_background_review_thread(
+                    self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
+                    focus=focus, task_cfg=task_cfg, review_run=review_run,
+                )
+
+                def _target_with_requeue() -> None:
+                    target()
+                    self._maybe_requeue_preempted_review(review_run, dict(
+                        messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
+                        focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1))
+
+                # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
+                # right profile.
+                threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
+            except Exception:
+                finish_background_review_run(self, review_run)
+                raise
+
+        if review_reflect:
+            # No run token: the single-flight _background_review_run slot belongs to the
+            # memory/skills axis; taking it here would stop the two axes from co-firing.
+            # The reflect fork is short, whitelisted to two tools, and safe to let finish.
+            reflect_target, _rprompt = spawn_background_review_thread(
+                self, messages_snapshot, task_cfg=task_cfg, review_run=None,
+                review_reflect=True,
             )
-
-            def _target_with_requeue() -> None:
-                target()
-                self._maybe_requeue_preempted_review(review_run, dict(
-                    messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
-                    focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1))
-
-            # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
-            # right profile.
-            threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
-        except Exception:
-            finish_background_review_run(self, review_run)
-            raise
+            threading.Thread(target=propagate_context_to_thread(reflect_target), daemon=True, name="bg-reflect").start()
 
     _REVIEW_REQUEUE_MAX_ATTEMPTS = 3
 

@@ -454,15 +454,25 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
                             and "skill_manage" in agent.valid_tool_names)
     if should_review_skills:
         agent._iters_since_skill = 0
+    # Reflect-distill trigger — turn-based cadence (mirrors turn_finalizer.py).
+    should_review_reflect = False
+    _reflect_interval = getattr(agent, "_reflect_nudge_interval", 0)
+    if _reflect_interval > 0:
+        agent._turns_since_reflect = getattr(agent, "_turns_since_reflect", 0) + 1
+        if agent._turns_since_reflect >= _reflect_interval:
+            should_review_reflect = True
+            agent._turns_since_reflect = 0
     # External memory sync skipped on interrupt/error (no partial transcripts).
     if not turn.interrupted and turn.error is None:
         _call_guarded(getattr(agent, "_sync_external_memory_for_turn", None), "external memory sync raised", kwargs=dict(
             original_user_message=original_user_message, final_response=turn.final_text, interrupted=False, messages=messages,
         ))
     # Background review fork: only when a trigger tripped AND a real final response exists.
-    if turn.final_text and not turn.interrupted and (should_review_memory or should_review_skills):
+    if turn.final_text and not turn.interrupted and (
+            should_review_memory or should_review_skills or should_review_reflect):
         _call_guarded(getattr(agent, "_spawn_background_review", None), "background review spawn raised", kwargs=dict(
             messages_snapshot=list(messages), review_memory=should_review_memory, review_skills=should_review_skills,
+            review_reflect=should_review_reflect,
         ))
     return usage_result
 
