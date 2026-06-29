@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 from collections import OrderedDict
@@ -141,6 +142,17 @@ DEFAULT_AGENT_IDENTITY = (
 # strip — distinct from None (file absent) so the identity guard can alert.
 SOUL_LOST_EMPTY_SENTINEL = (
     "[SOUL-LOST: SOUL.md present but empty — agent identity unavailable]"
+)
+
+# Sentinels for WAVE 4 split identity (CHARTER.md + PERSONA.md).
+SOUL_LOST_CHARTER_EMPTY_SENTINEL = (
+    "[SOUL-LOST: CHARTER.md present but empty — agent identity unavailable]"
+)
+SOUL_LOST_PERSONA_EMPTY_SENTINEL = (
+    "[SOUL-LOST: PERSONA.md present but empty — agent identity unavailable]"
+)
+SOUL_LOST_PERSONA_AUTHORING_SENTINEL = (
+    "[SOUL-LOST: PERSONA.md authoring violation — second-person prose or missing 'I am']"
 )
 
 
@@ -1493,9 +1505,108 @@ def _truncate_content(
     return content[:head_chars] + marker + content[-tail_chars:]
 
 
-def load_soul_md(context_length: Optional[int] = None, home_override: "Path | None" = None) -> Optional[str]:
-    """SOUL.md from HERMES_HOME (identity slot #1), or None.
+def _validate_persona_authoring(content: str) -> bool:
+    """Return True if PERSONA content passes first-person authoring check.
 
+    Rejects content that:
+    1. Does not contain a first-person self assertion ("I am")
+    2. Has leading second-person identity directives ("You are" / "You're")
+       in the first meaningful prose lines
+
+    Conservative: skips markdown headers and italic-only lines when scanning
+    for leading directives, so well-formed first-person PERSONA files pass.
+    """
+    if not re.search(r'\bI am\b', content):
+        return False
+
+    # Collect first prose lines (skip headers and italic-only delimiters)
+    prose_chunks: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith('#'):
+            continue
+        if stripped.startswith('_') and stripped.endswith('_'):
+            continue
+        prose_chunks.append(stripped)
+        if sum(len(c) for c in prose_chunks) >= 300:
+            break
+
+    leading_prose = " ".join(prose_chunks)[:300]
+    if re.search(r"\bYou are\b|\bYou're\b", leading_prose, re.IGNORECASE):
+        return False
+
+    return True
+
+
+def load_split_soul_md(
+    context_length: Optional[int] = None,
+    home_override: "Path | None" = None,
+) -> Optional[str]:
+    """Load CHARTER.md + PERSONA.md from HERMES_HOME, or None if not present.
+
+    Returns concatenated content when both files exist and are valid.
+    Returns a soul-loss sentinel when either file is empty, blocked by the
+    scanner, or PERSONA fails the first-person authoring check.
+    Returns None when split files are absent (caller falls back to SOUL.md).
+    """
+    hermes_home = Path(home_override) if home_override is not None else get_hermes_home()
+    charter_path = hermes_home / "CHARTER.md"
+    persona_path = hermes_home / "PERSONA.md"
+
+    # Require both files to be present before entering split mode
+    if not charter_path.exists() or not persona_path.exists():
+        return None
+
+    # --- CHARTER.md ---
+    try:
+        charter_raw = (_read_text_with_timeout(charter_path) or "").strip()
+    except Exception as e:
+        logger.debug("Could not read CHARTER.md from %s: %s", charter_path, e)
+        return None  # I/O failure → fall back to SOUL.md
+
+    if not charter_raw:
+        return SOUL_LOST_CHARTER_EMPTY_SENTINEL
+
+    charter_scanned = _scan_context_content(charter_raw, "CHARTER.md")
+    if is_soul_loss_sentinel(charter_scanned):
+        return charter_scanned  # [BLOCKED:...] from scanner
+
+    # --- PERSONA.md ---
+    try:
+        persona_raw = (_read_text_with_timeout(persona_path) or "").strip()
+    except Exception as e:
+        logger.debug("Could not read PERSONA.md from %s: %s", persona_path, e)
+        return None  # I/O failure → fall back to SOUL.md
+
+    if not persona_raw:
+        return SOUL_LOST_PERSONA_EMPTY_SENTINEL
+
+    persona_scanned = _scan_context_content(persona_raw, "PERSONA.md")
+    if is_soul_loss_sentinel(persona_scanned):
+        return persona_scanned  # [BLOCKED:...] from scanner
+
+    # First-person authoring enforcement
+    if not _validate_persona_authoring(persona_scanned):
+        return SOUL_LOST_PERSONA_AUTHORING_SENTINEL
+
+    # Apply truncation to each part, then concatenate
+    charter_final = _truncate_content(
+        charter_scanned, "CHARTER.md", context_length=context_length,
+        read_path=str(charter_path),
+    )
+    persona_final = _truncate_content(
+        persona_scanned, "PERSONA.md", context_length=context_length,
+        read_path=str(persona_path),
+    )
+    return f"{charter_final}\n\n{persona_final}"
+
+
+def load_soul_md(context_length: Optional[int] = None, home_override: "Path | None" = None) -> Optional[str]:
+    """Identity content from HERMES_HOME (identity slot #1), or None.
+
+    Tries CHARTER.md + PERSONA.md (WAVE 4 split mode) first; falls back to SOUL.md.
     Callers must pass ``skip_soul=True`` to ``build_context_files_prompt`` so it isn't injected twice.
     ``home_override`` pins the profile home (a thread that lost the HERMES_HOME ContextVar reads the wrong one).
 
@@ -1508,8 +1619,14 @@ def load_soul_md(context_length: Optional[int] = None, home_override: "Path | No
         from hermes_cli.config import ensure_hermes_home
         ensure_hermes_home()
     except Exception as e:
-        logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
-    soul_path = (Path(home_override) if home_override is not None else get_hermes_home()) / "SOUL.md"
+        logger.debug("Could not ensure HERMES_HOME before loading soul identity: %s", e)
+    _home = Path(home_override) if home_override is not None else get_hermes_home()
+    # WAVE 4: prefer split identity files (CHARTER.md + PERSONA.md) when both
+    # are present; sentinels propagate to the identity guard unchanged.
+    split_content = load_split_soul_md(context_length, home_override=_home)
+    if split_content is not None:
+        return split_content
+    soul_path = _home / "SOUL.md"
     if not soul_path.exists():
         return None
     try:
