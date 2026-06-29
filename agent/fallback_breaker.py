@@ -49,6 +49,9 @@ _DEFAULT_STATE_FILE = os.path.join(_DEFAULT_STATE_DIR, "fallback-breaker.json")
 # Simple config cache keyed on config-file mtime to avoid re-reading on every call.
 _CFG_CACHE: Optional[Dict[str, Any]] = None
 _CFG_MTIME: float = -1.0
+# One-shot guard so a persistent config-load failure (which silently disables
+# the breaker → money can bleed unbounded) is logged once, not on every call.
+_CFG_LOAD_WARNED: bool = False
 
 
 def is_metered(entry: Dict[str, Any]) -> bool:
@@ -63,7 +66,7 @@ def is_metered(entry: Dict[str, Any]) -> bool:
 
 def _load_cfg() -> Dict[str, Any]:
     """Load breaker section from hermes config. Cached by config-file mtime."""
-    global _CFG_CACHE, _CFG_MTIME
+    global _CFG_CACHE, _CFG_MTIME, _CFG_LOAD_WARNED
     try:
         from hermes_cli.config import load_config_readonly, get_config_path
         cfg_path = get_config_path()
@@ -75,8 +78,18 @@ def _load_cfg() -> Dict[str, Any]:
             cfg = load_config_readonly()
             _CFG_CACHE = dict(cfg.get("fallback_circuit_breaker") or {})
             _CFG_MTIME = mtime
+        _CFG_LOAD_WARNED = False  # successful load clears the one-shot warning
         return _CFG_CACHE
-    except Exception:
+    except Exception as e:
+        # Fail-open returns {} → breaker disabled → paid fallback uncapped.
+        # That is a money-relevant degradation, so make it visible at least once
+        # instead of failing silently (was a silent path; review M3).
+        if not _CFG_LOAD_WARNED:
+            logger.warning(
+                "fallback_breaker: config load failed — breaker DISABLED, paid "
+                "fallback is uncapped until config loads again: %s", e,
+            )
+            _CFG_LOAD_WARNED = True
         return {}
 
 
@@ -190,11 +203,23 @@ def breaker_check_and_record(
 
 
 def _write_breaker_state(fp: Any, state: Dict[str, Any]) -> None:
-    """Overwrite the locked state file with new content."""
+    """Overwrite the locked state file with new content.
+
+    Serialize to a string first, then write+flush+fsync in one shot so a
+    crash mid-write is far less likely to leave torn JSON.  A torn file would
+    decode-error → reset the counter → silently re-arm the cap (money-relevant),
+    so durability here directly bounds spend.  The flock is held on ``fp`` by
+    the caller, so an in-place rewrite is safe for cross-process correctness.
+    """
+    data = json.dumps(state)
     fp.seek(0)
     fp.truncate()
-    json.dump(state, fp)
+    fp.write(data)
     fp.flush()
+    try:
+        os.fsync(fp.fileno())
+    except OSError:
+        pass
 
 
 def breaker_gate(agent: Any, fb: Dict[str, Any]) -> Tuple[bool, bool]:
