@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_constants import (
-    get_hermes_home, get_skills_dir, is_wsl, reset_hermes_home_override, set_hermes_home_override,
+    get_default_hermes_root, get_hermes_home, get_skills_dir, is_wsl, reset_hermes_home_override,
+    set_hermes_home_override,
 )
 
 from agent.runtime_cwd import resolve_agent_cwd
@@ -153,6 +154,9 @@ SOUL_LOST_PERSONA_EMPTY_SENTINEL = (
 )
 SOUL_LOST_PERSONA_AUTHORING_SENTINEL = (
     "[SOUL-LOST: PERSONA.md authoring violation — second-person prose or missing 'I am']"
+)
+SOUL_LOST_ROLE_EMPTY_SENTINEL = (
+    "[SOUL-LOST: ROLE.md present but empty — agent role unavailable]"
 )
 
 
@@ -1544,16 +1548,24 @@ def load_split_soul_md(
     context_length: Optional[int] = None,
     home_override: "Path | None" = None,
 ) -> Optional[str]:
-    """Load CHARTER.md + PERSONA.md from HERMES_HOME, or None if not present.
+    """Load CHARTER.md + PERSONA.md from Hermes root, plus ROLE.md from profile dir.
 
-    Returns concatenated content when both files exist and are valid.
-    Returns a soul-loss sentinel when either file is empty, blocked by the
-    scanner, or PERSONA fails the first-person authoring check.
+    CHARTER.md and PERSONA.md always live at the Hermes root (get_default_hermes_root()),
+    not in profile subdirectories. ROLE.md, when present, is loaded from the active
+    profile's HERMES_HOME (get_hermes_home()).
+
+    Returns concatenated content when both CHARTER and PERSONA exist and are valid.
+    Returns a soul-loss sentinel when either file is empty, blocked by the scanner,
+    or PERSONA fails the first-person authoring check.
     Returns None when split files are absent (caller falls back to SOUL.md).
     """
-    hermes_home = Path(home_override) if home_override is not None else get_hermes_home()
-    charter_path = hermes_home / "CHARTER.md"
-    persona_path = hermes_home / "PERSONA.md"
+    profile_home = Path(home_override) if home_override is not None else get_hermes_home()
+    if profile_home.parent.name == "profiles":
+        hermes_root = profile_home.parent.parent
+    else:
+        hermes_root = get_default_hermes_root() if home_override is None else profile_home
+    charter_path = hermes_root / "CHARTER.md"
+    persona_path = hermes_root / "PERSONA.md"
 
     # Require both files to be present before entering split mode
     if not charter_path.exists() or not persona_path.exists():
@@ -1600,6 +1612,29 @@ def load_split_soul_md(
         persona_scanned, "PERSONA.md", context_length=context_length,
         read_path=str(persona_path),
     )
+
+    # --- ROLE.md (optional, per-profile) ---
+    role_path = profile_home / "ROLE.md"
+    if role_path.exists():
+        try:
+            role_raw = (_read_text_with_timeout(role_path) or "").strip()
+        except Exception as e:
+            logger.debug("Could not read ROLE.md from %s: %s", role_path, e)
+            return f"{charter_final}\n\n{persona_final}"
+
+        if not role_raw:
+            return SOUL_LOST_ROLE_EMPTY_SENTINEL
+
+        role_scanned = _scan_context_content(role_raw, "ROLE.md")
+        if is_soul_loss_sentinel(role_scanned):
+            return role_scanned  # [BLOCKED:...] from scanner
+
+        role_final = _truncate_content(
+            role_scanned, "ROLE.md", context_length=context_length,
+            read_path=str(role_path),
+        )
+        return f"{charter_final}\n\n{persona_final}\n\n{role_final}"
+
     return f"{charter_final}\n\n{persona_final}"
 
 
