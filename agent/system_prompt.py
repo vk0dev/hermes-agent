@@ -490,6 +490,9 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool
     Returns ``(parts, soul_loaded)``."""
     wants_soul = agent.load_soul_identity or not agent.skip_context_files
     _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent)) if wants_soul else None
+    # Fail-closed: blocked/empty SOUL fires alert + hard-stop rather than
+    # silently falling back to the generic DEFAULT_AGENT_IDENTITY.
+    _pb.guard_soul_identity(_soul_content)
     return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
 
 

@@ -137,6 +137,62 @@ DEFAULT_AGENT_IDENTITY = (
     "it. Depth is earned — give it when the user asks for detail, teaches, or the stakes demand it, not by default."
 )
 
+# Returned by load_soul_md when SOUL.md exists on disk but is empty after
+# strip — distinct from None (file absent) so the identity guard can alert.
+SOUL_LOST_EMPTY_SENTINEL = (
+    "[SOUL-LOST: SOUL.md present but empty — agent identity unavailable]"
+)
+
+
+def is_soul_loss_sentinel(content) -> bool:
+    """True when a SOUL identity value signals soul-loss (blocked or empty).
+
+    Checks only the two sentinel prefixes; empty string / None are NOT treated
+    as loss so existing tests that patch load_soul_md → '' remain unaffected.
+    """
+    return isinstance(content, str) and (
+        content.startswith("[BLOCKED:") or content.startswith("[SOUL-LOST:")
+    )
+
+
+class SoulIdentityLostError(RuntimeError):
+    """Raised when the SOUL identity slot is lost (blocked/empty) instead of
+    silently falling back to the generic DEFAULT_AGENT_IDENTITY."""
+
+
+def _fire_soul_loss_alert(sentinel: str) -> None:
+    """Best-effort Telegram alert via the standalone send_message path.
+
+    Never raises — failures are logged so the caller still hard-stops.
+    """
+    try:
+        home = str(get_hermes_home())
+    except Exception:
+        home = "<unknown>"
+    target = os.getenv("HERMES_SOUL_ALERT_TARGET", "telegram")
+    msg = (
+        "🚨 SOUL IDENTITY LOST — refusing generic fallback.\n"
+        f"home: {home}\nreason: {sentinel}\n"
+        "The agent will NOT start with a generic identity. "
+        "Inspect SOUL.md (empty or blocked by injection scanner)."
+    )
+    try:
+        from tools.send_message_tool import send_message_tool
+        send_message_tool({"action": "send", "target": target, "message": msg})
+    except Exception as e:
+        logger.error("Soul-loss alert failed to send (%s): %s", target, e)
+
+
+def guard_soul_identity(soul_content) -> None:
+    """Fire alert + hard-stop if soul_content is a loss sentinel; else no-op."""
+    if is_soul_loss_sentinel(soul_content):
+        logger.error(
+            "SOUL identity lost: %s — refusing DEFAULT fallback", soul_content
+        )
+        _fire_soul_loss_alert(soul_content)
+        raise SoulIdentityLostError(soul_content)
+
+
 HERMES_AGENT_HELP_GUIDANCE = (
     # Injected only when skill_view exists AND the hermes-agent skill is installed (system_prompt.py slot
     # resolution). No "when the two differ" clause: docs-are-authoritative already carries the precedence.
@@ -1464,7 +1520,10 @@ def load_soul_md(context_length: Optional[int] = None, home_override: "Path | No
             from tools.bot_mode_probe import strip_legacy_protocol
             content = strip_legacy_protocol(content).strip()
         if not content:
-            return None
+            # File exists but is empty (or held only the dead Bot Mode
+            # roster) — signal loss so the identity guard can alert instead
+            # of silently falling back to the generic identity.
+            return SOUL_LOST_EMPTY_SENTINEL
         return _truncate_content(_scan_context_content(content, "SOUL.md"), "SOUL.md", context_length=context_length,
                                  read_path=str(soul_path))
     except Exception as e:
@@ -1597,7 +1656,11 @@ def build_context_files_prompt(
         sections = [_load_hermes_md(cwd_path, context_length) or _load_agents_md(cwd_path, context_length)
                     or _load_claude_md(cwd_path, context_length) or _load_cursorrules(cwd_path, context_length)]
     if not skip_soul:
-        sections.append(load_soul_md(context_length, home_override=home_override))
+        # Loss sentinels ([BLOCKED:...] / [SOUL-LOST:...]) are skipped here;
+        # the identity guard in system_prompt.py handles them with alert+raise.
+        _soul = load_soul_md(context_length, home_override=home_override)
+        if not is_soul_loss_sentinel(_soul):
+            sections.append(_soul)
     sections = [s for s in sections if s]
     if not sections:
         return ""

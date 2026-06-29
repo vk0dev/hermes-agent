@@ -811,3 +811,87 @@ class TestConversationStartedTwoLine:
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
 
+
+
+# =========================================================================
+# SOUL identity guard — alert + hard-stop on blocked/empty sentinel
+# (vk-release: silent-soul-loss guard, ported to the decomposed prompt
+# assembly — patches target agent.prompt_builder, not run_agent re-exports)
+# =========================================================================
+
+class TestSoulIdentityGuard:
+    """build_system_prompt_parts must fire alert + raise on loss sentinels."""
+
+    def _make_soul_agent(self):
+        return _make_agent(load_soul_identity=True)
+
+    def _run_with_soul(self, soul_return_value, mock_send):
+        agent = self._make_soul_agent()
+        with (
+            patch("agent.prompt_builder.load_soul_md", return_value=soul_return_value),
+            patch("agent.prompt_builder.build_environment_hints", return_value=""),
+            patch("agent.prompt_builder.build_context_files_prompt", return_value=""),
+            patch("tools.send_message_tool.send_message_tool", mock_send),
+        ):
+            return build_system_prompt_parts(agent)
+
+    def test_blocked_soul_raises_and_fires_alert(self):
+        from unittest.mock import MagicMock
+        from agent.prompt_builder import SoulIdentityLostError
+        import pytest
+
+        mock_send = MagicMock(return_value="{}")
+        with pytest.raises(SoulIdentityLostError):
+            self._run_with_soul("[BLOCKED: SOUL.md injection attempt]", mock_send)
+        mock_send.assert_called_once()
+        call_args = mock_send.call_args[0][0]
+        assert "SOUL IDENTITY LOST" in call_args.get("message", "")
+
+    def test_empty_soul_sentinel_raises_and_fires_alert(self):
+        from unittest.mock import MagicMock
+        from agent.prompt_builder import SoulIdentityLostError, SOUL_LOST_EMPTY_SENTINEL
+        import pytest
+
+        mock_send = MagicMock(return_value="{}")
+        with pytest.raises(SoulIdentityLostError):
+            self._run_with_soul(SOUL_LOST_EMPTY_SENTINEL, mock_send)
+        mock_send.assert_called_once()
+
+    def test_alert_send_failure_still_hard_stops(self):
+        from unittest.mock import MagicMock
+        from agent.prompt_builder import SoulIdentityLostError
+        import pytest
+
+        mock_send = MagicMock(side_effect=RuntimeError("network error"))
+        with pytest.raises(SoulIdentityLostError):
+            self._run_with_soul("[BLOCKED: SOUL.md ...]", mock_send)
+
+    def test_normal_soul_no_alert_no_raise(self):
+        from unittest.mock import MagicMock
+        from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+
+        mock_send = MagicMock()
+        result = self._run_with_soul("Custom SOUL identity text", mock_send)
+        mock_send.assert_not_called()
+        assert "Custom SOUL identity text" in result["stable"]
+        assert DEFAULT_AGENT_IDENTITY not in result["stable"]
+
+    def test_empty_string_soul_no_guard_uses_default(self):
+        # Existing tests patch load_soul_md → ""; guard must be no-op → DEFAULT used.
+        from unittest.mock import MagicMock
+        from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+
+        mock_send = MagicMock()
+        result = self._run_with_soul("", mock_send)
+        mock_send.assert_not_called()
+        assert DEFAULT_AGENT_IDENTITY in result["stable"]
+
+    def test_none_soul_no_guard_uses_default(self):
+        # load_soul_md returns None when file is absent — guard must be no-op.
+        from unittest.mock import MagicMock
+        from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+
+        mock_send = MagicMock()
+        result = self._run_with_soul(None, mock_send)
+        mock_send.assert_not_called()
+        assert DEFAULT_AGENT_IDENTITY in result["stable"]
