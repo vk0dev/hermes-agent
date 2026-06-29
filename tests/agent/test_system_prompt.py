@@ -895,3 +895,37 @@ class TestSoulIdentityGuard:
         result = self._run_with_soul(None, mock_send)
         mock_send.assert_not_called()
         assert DEFAULT_AGENT_IDENTITY in result["stable"]
+
+
+# =========================================================================
+# SELF.md journal volatile-tier injection
+# =========================================================================
+
+def _all_prompt_parts(agent):
+    """Build all prompt parts under the standard set of patches."""
+    from unittest.mock import patch
+    with (
+        patch("agent.prompt_builder.load_soul_md", return_value=""),
+        patch("agent.prompt_builder.build_environment_hints", return_value=""),
+        patch("agent.prompt_builder.build_context_files_prompt", return_value=""),
+    ):
+        return build_system_prompt_parts(agent)
+
+
+class TestSelfTailInjection:
+    def test_self_tail_in_volatile_not_stable(self):
+        from agent.self_journal import append_reflection
+
+        append_reflection("I completed the W5.1 journal module today.")
+
+        parts = _all_prompt_parts(_make_agent())
+        assert "## Recent reflections" in parts["volatile"]
+        assert "W5.1 journal module" in parts["volatile"]
+        assert "Recent reflections" not in parts["stable"]
+
+    def test_no_heading_when_self_absent(self):
+        # conftest redirects HERMES_HOME to tmpdir with no SELF.md by default
+        parts = _all_prompt_parts(_make_agent())
+        assert "Recent reflections" not in parts["volatile"]
+        assert "Recent reflections" not in parts["stable"]
+        assert "Recent reflections" not in parts.get("context", "")

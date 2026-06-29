@@ -655,6 +655,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Plugin sections are confined to one coarse anchor in the volatile tail so
     # a resumed process can reconstruct the stable prefix without re-running plugins.
     volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
+    # Recent reflections (SELF.md journal) — volatile/ephemeral ONLY, never cached.
+    try:
+        from agent.self_journal import read_self_tail
+        _self_tail = read_self_tail()
+        if _self_tail:
+            volatile_parts.append("## Recent reflections\n\n" + _self_tail)
+    except Exception:
+        pass
     volatile_parts.append(_timestamp_line(agent))
     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
     # host examples cannot shadow it during persisted-prompt validation.
