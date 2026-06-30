@@ -220,6 +220,68 @@ def _existing_task(kb, conn, tid: str):
     return task
 
 
+# ---------------------------------------------------------------------------
+# Merge-proof guard for code-producing task completion
+# ---------------------------------------------------------------------------
+# cc-run workers that produce code commits must supply CC_RUN_JSON evidence
+# in metadata['cc_run'] before the task can transition to done.  Research /
+# docs tasks (scratch workspace, no claude-code skill) are exempt.
+
+_CODE_TASK_SKILLS = frozenset({"claude-code"})
+_CODE_TASK_WORKSPACE_KINDS = frozenset({"worktree", "dir"})
+
+_VALID_CC_RUN_OUTCOMES = frozenset({
+    "merged",
+    "approved_unmerged",
+    "escalate_merge",
+    "escalate_review",
+})
+
+
+def _is_code_task(task) -> bool:
+    """True when the task's workspace or skills indicate code-producing work."""
+    ws = getattr(task, "workspace_kind", None) or "scratch"
+    if ws in _CODE_TASK_WORKSPACE_KINDS:
+        return True
+    skills = getattr(task, "skills", None) or []
+    return bool(_CODE_TASK_SKILLS.intersection(skills))
+
+
+def _check_merge_proof(metadata: Optional[dict]) -> Optional[str]:
+    """Return an error string if cc-run merge proof is absent or invalid, else None."""
+    cc_run = (metadata or {}).get("cc_run")
+    if not isinstance(cc_run, dict):
+        return (
+            "code-producing task requires metadata={'cc_run': {...}} with outcome "
+            "from CC_RUN_JSON. Pass the parsed CC_RUN_JSON as metadata['cc_run']. "
+            "Valid outcomes: merged (with merge.merged=True), approved_unmerged, "
+            "escalate_merge, escalate_review (last three require last_commit). "
+            "If cc-run was not used, block the task instead of completing it."
+        )
+    outcome = cc_run.get("outcome")
+    if outcome not in _VALID_CC_RUN_OUTCOMES:
+        return (
+            f"cc_run.outcome={outcome!r} is not a recognised completion outcome. "
+            f"Expected one of: {', '.join(sorted(_VALID_CC_RUN_OUTCOMES))}. "
+            "If cc-run failed, use kanban_block instead of kanban_complete."
+        )
+    if outcome == "merged":
+        merge = cc_run.get("merge") or {}
+        if not merge.get("merged"):
+            return (
+                "cc_run.outcome='merged' but cc_run.merge.merged is not True "
+                f"(got {merge!r}). Provide a verified CC_RUN_JSON with merge.merged=True."
+            )
+    else:
+        if not cc_run.get("last_commit"):
+            return (
+                f"cc_run.outcome={outcome!r} requires cc_run.last_commit "
+                "(branch/SHA) so the unmerged work can be found. "
+                "Add last_commit from CC_RUN_JSON to the cc_run dict."
+            )
+    return None
+
+
 def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
 
@@ -562,6 +624,13 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        if task and _is_code_task(task):
+            proof_err = _check_merge_proof(metadata)
+            if proof_err:
+                return tool_error(
+                    f"kanban_complete blocked — merge proof required for "
+                    f"code-producing task {tid}: {proof_err}"
+                )
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,

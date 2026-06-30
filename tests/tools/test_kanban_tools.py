@@ -1161,3 +1161,161 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# Merge-proof guard: cc-run code-producing tasks (t_3becfc31)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def worktree_worker_env(monkeypatch, tmp_path):
+    """Worker env for a task with workspace_kind='worktree' (code-producing)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="worktree-test", assignee="test-worker",
+            workspace_kind="worktree", workspace_path="/tmp/test-wt",
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
+
+
+@pytest.fixture
+def claude_code_worker_env(monkeypatch, tmp_path):
+    """Worker env for a scratch task with claude-code skill (code-producing)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="claude-code-test", assignee="test-worker",
+            skills=["claude-code"],
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
+
+
+def test_code_task_complete_requires_merge_proof(worktree_worker_env):
+    """worktree task without cc_run metadata must be blocked."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "done",
+        "metadata": {"changed_files": ["src/foo.py"]},
+    })
+    err = json.loads(out).get("error", "")
+    assert err, f"expected error, got {out!r}"
+    assert "merge proof required" in err
+    assert "cc_run" in err
+
+
+def test_code_task_complete_with_merged_proof_passes(worktree_worker_env):
+    """worktree task with cc_run.outcome=merged and merge.merged=True passes."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "merged via cc-run",
+        "metadata": {
+            "cc_run": {
+                "outcome": "merged",
+                "merge": {"merged": True, "commit": "abc123def"},
+            }
+        },
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, f"expected ok, got {out!r}"
+
+
+def test_code_task_complete_with_approved_unmerged_passes(worktree_worker_env):
+    """approved_unmerged with last_commit is a valid completion path."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "approved but not merged — escalated for human review",
+        "metadata": {
+            "cc_run": {
+                "outcome": "approved_unmerged",
+                "last_commit": "wt/t_example@deadbeef123",
+            }
+        },
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, f"expected ok, got {out!r}"
+
+
+def test_code_task_complete_merged_without_merge_field_blocked(worktree_worker_env):
+    """outcome=merged but merge.merged=False must be rejected."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "claimed merged",
+        "metadata": {
+            "cc_run": {
+                "outcome": "merged",
+                "merge": {"merged": False},
+            }
+        },
+    })
+    err = json.loads(out).get("error", "")
+    assert err, f"expected error, got {out!r}"
+    assert "merge.merged" in err
+
+
+def test_code_task_complete_escalate_without_commit_blocked(worktree_worker_env):
+    """escalate_merge without last_commit must be rejected."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "escalated without evidence",
+        "metadata": {
+            "cc_run": {
+                "outcome": "escalate_merge",
+            }
+        },
+    })
+    err = json.loads(out).get("error", "")
+    assert err, f"expected error, got {out!r}"
+    assert "last_commit" in err
+
+
+def test_scratch_task_no_proof_required(worker_env):
+    """scratch task without claude-code skill does NOT require merge proof."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "research done",
+        "metadata": {"sources": ["https://example.com"]},
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, f"expected ok for scratch task, got {out!r}"
+
+
+def test_claude_code_skill_task_requires_merge_proof(claude_code_worker_env):
+    """scratch task with claude-code skill also requires merge proof."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "implemented feature",
+        "metadata": {"changed_files": ["src/feature.py"]},
+    })
+    err = json.loads(out).get("error", "")
+    assert err, f"expected error, got {out!r}"
+    assert "merge proof required" in err
