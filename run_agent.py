@@ -931,6 +931,11 @@ class AIAgent(
     def commit_memory_session(self, messages: list = None) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
         down."""
+        try:
+            from agent.background_review import maybe_spawn_session_end_reflect
+            maybe_spawn_session_end_reflect(self, messages or [])
+        except Exception:
+            pass
         if self._memory_manager:
             _quietly(lambda: self._memory_manager.on_session_end(messages or []))
         _notify_context_engine_session_end(self, messages)
