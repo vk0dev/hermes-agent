@@ -1400,9 +1400,22 @@ def maybe_spawn_session_end_reflect(agent: Any, messages_snapshot: List[Dict]) -
         return False
 
 
+def maybe_flush_reflect_on_idle(agent: Any, messages_snapshot: List[Dict]) -> bool:
+    """Fire reflect flush when the session is idle (no new turns expected soon).
+
+    Equivalent to maybe_spawn_session_end_reflect but named explicitly for
+    the idle-triggered path so callers can be clear about the trigger.
+    Wired into gateway session-idle hooks so short sessions that end before
+    the interval-N trigger still produce a SELF.md reflection.
+
+    Best-effort; never raises.
+    """
+    return maybe_spawn_session_end_reflect(agent, messages_snapshot)
+
+
 __all__ = [
     "_MEMORY_REVIEW_PROMPT", "_SKILL_REVIEW_PROMPT", "_COMBINED_REVIEW_PROMPT", "_REFLECT_DISTILL_PROMPT",
-    "ReflectMemoryShim", "maybe_spawn_session_end_reflect",
+    "ReflectMemoryShim", "maybe_spawn_session_end_reflect", "maybe_flush_reflect_on_idle",
     "load_background_review_settings",
     "spawn_background_review_thread", "summarize_background_review_actions", "build_memory_write_metadata",
 ]

@@ -918,6 +918,12 @@ def run_curator_review(
         before_names = set(_by_name(before_report))
         if consolidate:
             final_summary, llm_meta = _consolidation_pass(prefix, auto_summary, dry_run, before_names)
+            # Persona consolidation piggybacks on the weekly consolidation pass.
+            try:
+                from agent import persona_draft as _pd
+                _pd.run_persona_consolidation(on_summary=on_summary)
+            except Exception as e:
+                logger.debug("Curator persona consolidation failed: %s", e, exc_info=True)
         else:
             # Prune-only run: record it and write a report, but never fork.
             final_summary = f"{prefix}{auto_summary}; llm: skipped (consolidation off)"
