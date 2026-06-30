@@ -634,3 +634,94 @@ def test_session_end_reflect_via_commit_memory_session(monkeypatch):
 
     assert len(spawn_calls) == 1
     assert spawn_calls[0]["review_reflect"] is True
+
+
+# ---------------------------------------------------------------------------
+# 8. CLI _run_cleanup trigger — session-end reflect on true exit
+# ---------------------------------------------------------------------------
+
+def test_cli_run_cleanup_fires_session_end_reflect(monkeypatch):
+    """_run_cleanup calls maybe_spawn_session_end_reflect when turns are pending."""
+    import cli as _cli
+    from unittest.mock import MagicMock
+
+    spawn_calls = []
+    agent = MagicMock()
+    agent._reflect_nudge_interval = 5
+    agent._turns_since_reflect = 3
+    agent._session_messages = [{"role": "user", "content": "hello"}]
+    agent._spawn_background_review = lambda **kw: spawn_calls.append(kw)
+    agent.shutdown_memory_provider = MagicMock()
+
+    monkeypatch.setattr(_cli, "_active_agent_ref", agent)
+    monkeypatch.setattr(_cli, "_cleanup_done", False)
+    monkeypatch.setattr(_cli, "_reset_terminal_input_modes_on_exit", lambda: None)
+    monkeypatch.setattr(_cli, "_cleanup_all_terminals", lambda: None)
+    monkeypatch.setattr(_cli, "_cleanup_all_browsers", lambda: None)
+
+    _cli._run_cleanup(notify_session_finalize=False)
+
+    assert len(spawn_calls) == 1
+    assert spawn_calls[0]["review_reflect"] is True
+    assert agent._turns_since_reflect == 0
+
+
+def test_cli_run_cleanup_skips_reflect_when_no_pending_turns(monkeypatch):
+    """_run_cleanup does NOT fire reflect when _turns_since_reflect == 0 (de-dup)."""
+    import cli as _cli
+    from unittest.mock import MagicMock
+
+    spawn_calls = []
+    agent = MagicMock()
+    agent._reflect_nudge_interval = 5
+    agent._turns_since_reflect = 0  # interval just fired — de-dup guard
+    agent._session_messages = [{"role": "user", "content": "hello"}]
+    agent._spawn_background_review = lambda **kw: spawn_calls.append(kw)
+    agent.shutdown_memory_provider = MagicMock()
+
+    monkeypatch.setattr(_cli, "_active_agent_ref", agent)
+    monkeypatch.setattr(_cli, "_cleanup_done", False)
+    monkeypatch.setattr(_cli, "_reset_terminal_input_modes_on_exit", lambda: None)
+    monkeypatch.setattr(_cli, "_cleanup_all_terminals", lambda: None)
+    monkeypatch.setattr(_cli, "_cleanup_all_browsers", lambda: None)
+
+    _cli._run_cleanup(notify_session_finalize=False)
+
+    assert len(spawn_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# 9. Gateway expiry watcher trigger — maybe_flush_reflect_on_idle
+# ---------------------------------------------------------------------------
+
+def test_maybe_flush_reflect_on_idle_delegates_to_session_end():
+    """maybe_flush_reflect_on_idle is a named alias for maybe_spawn_session_end_reflect."""
+    from agent.background_review import maybe_flush_reflect_on_idle, maybe_spawn_session_end_reflect
+    from unittest.mock import MagicMock, patch
+
+    agent = MagicMock()
+    agent._reflect_nudge_interval = 5
+    agent._turns_since_reflect = 3
+    spawn_calls = []
+    agent._spawn_background_review = lambda **kw: spawn_calls.append(kw)
+
+    result = maybe_flush_reflect_on_idle(agent, [{"role": "user", "content": "hi"}])
+
+    assert result is True
+    assert len(spawn_calls) == 1
+    assert agent._turns_since_reflect == 0
+
+
+def test_gateway_expiry_reflect_best_effort_on_error():
+    """maybe_flush_reflect_on_idle errors are swallowed (best-effort contract)."""
+    from agent.background_review import maybe_flush_reflect_on_idle
+    from unittest.mock import MagicMock
+
+    agent = MagicMock()
+    agent._reflect_nudge_interval = 5
+    agent._turns_since_reflect = 3
+    agent._spawn_background_review = MagicMock(side_effect=RuntimeError("reflect boom"))
+
+    result = maybe_flush_reflect_on_idle(agent, [{"role": "user", "content": "hi"}])
+
+    assert result is False  # error swallowed
