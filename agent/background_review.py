@@ -1378,10 +1378,12 @@ def maybe_spawn_session_end_reflect(agent: Any, messages_snapshot: List[Dict]) -
     """Fire a final reflect review at a genuine session boundary if turns have
     accumulated since the last reflect dispatch.  Best-effort; never raises.
 
-    Wired into AIAgent.commit_memory_session (session rotation: /new, context
-    compression) — NOT shutdown_memory_provider, where the daemon fork cannot
-    finish before process exit.  Resets the counter so a subsequent interval
-    fire on the same accumulated turns is suppressed.
+    Call sites:
+    - AIAgent.commit_memory_session (session rotation: /new, context compression)
+    - cli._run_cleanup (atexit / true CLI exit path)
+
+    Resets the counter so a subsequent interval fire on the same accumulated
+    turns is suppressed (de-dup guard: _turns_since_reflect == 0 after fire).
     """
     if not getattr(agent, "_reflect_nudge_interval", 0):
         return False
@@ -1405,8 +1407,8 @@ def maybe_flush_reflect_on_idle(agent: Any, messages_snapshot: List[Dict]) -> bo
 
     Equivalent to maybe_spawn_session_end_reflect but named explicitly for
     the idle-triggered path so callers can be clear about the trigger.
-    Wired into gateway session-idle hooks so short sessions that end before
-    the interval-N trigger still produce a SELF.md reflection.
+    Wired into gateway _session_expiry_watcher so short sessions that expire
+    before the interval-N trigger still produce a SELF.md reflection.
 
     Best-effort; never raises.
     """

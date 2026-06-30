@@ -827,6 +827,13 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
             if _should_emit_cleanup_session_finalize(cleanup_session_id):
                 _notify_session_finalize(session_id=cleanup_session_id, platform="cli", reason="shutdown")
         try:
+            if _active_agent_ref:
+                from agent.background_review import maybe_spawn_session_end_reflect
+                _reflect_msgs = getattr(_active_agent_ref, "_session_messages", None)
+                maybe_spawn_session_end_reflect(_active_agent_ref, _reflect_msgs or [])
+        except Exception:
+            pass
+        try:
             _shutdown_agent_memory_provider(_active_agent_ref)
         except Exception as e:
             logger.warning("CLI cleanup memory shutdown failed: %s", e, exc_info=True)
