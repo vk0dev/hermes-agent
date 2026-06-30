@@ -598,7 +598,8 @@ def finalize_turn(
     if _should_review_skills:
         agent._iters_since_skill = 0
 
-    # Check reflect-distill trigger — turn-based cadence.
+    # Check reflect trigger — turn-based interval (default ~10 turns).
+    # Increments _turns_since_reflect each finalized turn; resets on fire.
     _should_review_reflect = False
     _reflect_interval = getattr(agent, "_reflect_nudge_interval", 0)
     if _reflect_interval > 0:

@@ -451,21 +451,6 @@ _SKILL_REVIEW_PROMPT = (
     "stop. Otherwise, act."
 )
 
-_REFLECT_DISTILL_PROMPT = (
-    "Review the conversation above and extract two kinds of signal:\n\n"
-    "1. **Durable facts** — externally verifiable facts about people, projects, "
-    "or the world that emerged (e.g. 'colleague Alex birthday is 2026-03-03', "
-    "'the team migrated to Python 3.12 in April 2026'). "
-    "Record each with ``record_fact``.\n\n"
-    "2. **First-person reflections** — observations about your own behaviour, "
-    "patterns you noticed, or lessons about how *you* work in this session. "
-    "Write in the first person: 'I learned …', 'I tend to …', 'When X, I …'. "
-    "Append each with ``append_reflection``.\n\n"
-    "You can ONLY call ``record_fact`` and ``append_reflection`` — other tools "
-    "will be denied at runtime. If there is nothing worth recording on either "
-    "dimension, say 'Nothing to reflect.' and stop."
-)
-
 _COMBINED_REVIEW_PROMPT = (
     "Review the conversation above and update two things:\n\n"
     "**Memory**: who the user is. Did the user reveal persona, desires, preferences, personal "
@@ -586,7 +571,7 @@ def _collect_review_call_details(review_messages: List[Dict]) -> Tuple[set, dict
     """Map review-agent tool_call ids -> parsed call arguments for notify tools. Result JSON only
     says "Entry added"; the call arguments carry action, target and content previews. Restricting
     to notify tools keeps helper tools from surfacing as memory work just because they succeeded."""
-    notify_tools = {"memory", "skill_manage"}
+    notify_tools = {"memory", "skill_manage", "honcho_conclude", "self_reflect"}
     all_tool_call_ids: set = set()
     call_details: dict = {}
     for msg in review_messages or []:
@@ -833,30 +818,161 @@ def _detach_fork_compression(review_agent: Any) -> None:
         review_agent._review_defer_compaction_before_first_response = True
 
 
-def _find_honcho_provider(agent: Any) -> Any:
-    """Return the parent agent's live HonchoMemoryProvider, or None.
+_REFLECT_DISTILL_PROMPT = (
+    "Review the conversation above and perform two reflect+distill actions.\n\n"
+    "**Part 1 — Durable facts about the world and people (→ honcho_conclude):**\n"
+    "Extract facts that are STABLE over time and belong to the world or the people "
+    "in it, NOT to your own behaviour or this session's task progress. "
+    "Examples of durable facts: a person's birthday, role or title, a project's "
+    "confirmed status (launched / paused / cancelled), a stable decision made by "
+    "the user or their team, a recurring preference or constraint about the user's "
+    "life. Write each fact as a concise Russian statement (honcho accepts English "
+    "internally but user-visible projections should be in Russian). "
+    "Call honcho_conclude once per fact (peer='user' by default). "
+    "Skip facts that are ephemeral task progress ('fixed bug X'), "
+    "session-specific context, or things that will change in a week.\n\n"
+    "**Part 2 — First-person self-reflection about yourself (→ self_reflect):**\n"
+    "Write 1–3 SHORT first-person lines capturing a genuine insight or shift you "
+    "noticed about how you work, think, or interact. These belong in SELF.md and "
+    "must be in the first person (starting with 'I', 'Я', or equivalent). "
+    "Examples: 'I notice I default to verbose answers when the user wants brevity.' "
+    "/ 'Я понял, что предпочитаю явный список шагов перед кодингом.' "
+    "Call self_reflect once per line. Do NOT describe task outcomes — describe "
+    "something about yourself, your reasoning style, or how you handled the "
+    "interaction.\n\n"
+    "If this session contained no durable world-facts and no genuine self-insight, "
+    "say 'Nothing to save.' and stop. Do not invent facts or forced reflections."
+)
 
-    Used by the reflect axis to handoff the provider to the reflect fork via
-    thread-local so ``record_fact`` can call ``create_conclusion`` directly
-    without rebuilding a provider (and bypassing skip_memory=True isolation).
+
+class ReflectMemoryShim:
+    """Minimal duck-type MemoryManager for the reflect-distill background fork.
+
+    Design rationale (W5.2, t_b8ffee70): the review fork is always created with
+    skip_memory=True so the parent's honcho session is never polluted by the
+    harness prompt flowing through on_turn_start / prefetch_all / sync_all, and
+    teardown of the fork never calls shutdown_all on the parent's honcho provider.
+    ReflectMemoryShim is assigned to review_agent._memory_manager AFTER the fork
+    is created, giving it exactly two tools (honcho_conclude, self_reflect) without
+    re-opening the memory provider lifecycle.
+
+    Key invariants:
+    - All lifecycle hooks (on_turn_start, prefetch_all, sync_all, on_session_end,
+      shutdown_all, flush_all, shutdown) are NO-OPS — this is what prevents
+      ingestion-pollution and parent-teardown.
+    - honcho_conclude is delegated to the parent's _memory_manager so it uses the
+      correct honcho session_key; if the parent has no honcho, it silently no-ops.
+    - self_reflect calls agent.self_journal.append_reflection (FIFO/guard in W5.1;
+      we reuse it, not duplicate it).
+    - Responses are normalised to {"success": True/False, "message": "..."} so
+      summarize_background_review_actions can surface them without special-casing
+      the raw honcho {"result": ...} format.
     """
-    mm = getattr(agent, "_memory_manager", None)
-    if mm is None:
-        return None
-    try:
-        from plugins.memory.honcho import HonchoMemoryProvider
-        for provider in getattr(mm, "providers", []):
-            if isinstance(provider, HonchoMemoryProvider):
-                return provider
-    except Exception:
+
+    def __init__(self, parent_memory_manager: Any, parent_agent: Any) -> None:
+        self._parent_mm = parent_memory_manager
+        self._parent_agent = parent_agent
+
+    # --- Tool surface (duck-typing MemoryManager) ---
+
+    def has_tool(self, tool_name: str) -> bool:
+        return tool_name in {"honcho_conclude", "self_reflect"}
+
+    def get_all_tool_names(self) -> set:
+        return {"honcho_conclude", "self_reflect"}
+
+    def get_all_tool_schemas(self) -> List[Dict]:
+        from plugins.memory.honcho import CONCLUDE_SCHEMA
+        self_reflect_schema = {
+            "name": "self_reflect",
+            "description": (
+                "Write a short first-person reflection line to SELF.md. "
+                "The line must be in the first person (start with 'I' / 'Я' or "
+                "equivalent). Datestamp and FIFO cap (≤10 entries) are applied "
+                "automatically. Use this for genuine self-insights only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "line": {
+                        "type": "string",
+                        "description": (
+                            "The first-person reflection line to record, "
+                            "without a date prefix (added automatically)."
+                        ),
+                    },
+                },
+                "required": ["line"],
+            },
+        }
+        return [CONCLUDE_SCHEMA, self_reflect_schema]
+
+    def handle_tool_call(
+        self, tool_name: str, args: Dict[str, Any], **kwargs
+    ) -> str:
+        if tool_name == "honcho_conclude":
+            return self._handle_honcho_conclude(args)
+        if tool_name == "self_reflect":
+            return self._handle_self_reflect(args)
+        return json.dumps({"success": False, "message": f"Unknown tool: {tool_name}"})
+
+    def _handle_honcho_conclude(self, args: Dict[str, Any]) -> str:
+        parent_mm = self._parent_mm
+        if parent_mm is None or not callable(getattr(parent_mm, "handle_tool_call", None)):
+            return json.dumps({"success": False, "message": "No honcho provider available."})
+        try:
+            raw = parent_mm.handle_tool_call("honcho_conclude", args)
+            data = json.loads(raw)
+            # Normalise to {"success": True/False, "message": "..."} so the
+            # summarizer's data.get("success") check works uniformly.
+            if "result" in data and "success" not in data:
+                return json.dumps({"success": True, "message": data["result"]})
+            return raw
+        except Exception as exc:
+            return json.dumps({"success": False, "message": f"honcho_conclude failed: {exc}"})
+
+    def _handle_self_reflect(self, args: Dict[str, Any]) -> str:
+        line = (args.get("line") or "").strip()
+        try:
+            from agent import self_journal
+            ok = self_journal.append_reflection(line)
+            if ok:
+                return json.dumps({"success": True, "message": f"Reflection created: {line}"})
+            return json.dumps({"success": False, "message": "Reflection rejected (guard or I/O error)."})
+        except Exception as exc:
+            return json.dumps({"success": False, "message": f"self_reflect failed: {exc}"})
+
+    # --- Lifecycle hooks — all no-ops (see class docstring) ---
+
+    def on_turn_start(self, *args, **kwargs) -> None:
         pass
-    return None
+
+    def prefetch_all(self, *args, **kwargs) -> None:
+        pass
+
+    def queue_prefetch_all(self, *args, **kwargs) -> None:
+        pass
+
+    def sync_all(self, *args, **kwargs) -> None:
+        pass
+
+    def on_session_end(self, *args, **kwargs) -> None:
+        pass
+
+    def shutdown_all(self, *args, **kwargs) -> None:
+        pass
+
+    def flush_all(self, *args, **kwargs) -> None:
+        pass
+
+    def shutdown(self, *args, **kwargs) -> None:
+        pass
+
+    def initialize_all(self, *args, **kwargs) -> None:
+        pass
 
 
-def _fork_init_kwargs(
-    agent: Any, rt: Dict[str, Any], routed: bool, max_iterations: int,
-    toolsets_override: Optional[List[str]] = None,
-) -> Dict[str, Any]:
+def _fork_init_kwargs(agent: Any, rt: Dict[str, Any], routed: bool, max_iterations: int) -> Dict[str, Any]:
     """AIAgent constructor kwargs for the review fork. skip_memory=True: an external memory plugin
     scoped to the parent's session_id would leak the harness prompt into the user's real memory
     namespace; built-in MEMORY.md/USER.md state is re-bound by the caller. Toolsets match the
@@ -868,13 +984,8 @@ def _fork_init_kwargs(
         "api_mode": rt.get("api_mode"), "base_url": rt.get("base_url") or None,
         "api_key": rt.get("api_key") or None, "credential_pool": rt.get("credential_pool"),
         "request_overrides": rt.get("request_overrides") or {}, "parent_session_id": agent.session_id,
-        # toolsets_override (reflect axis) intentionally bypasses prefix-cache
-        # parity — that niche axis fires infrequently and needs its own tools.
-        "enabled_toolsets": toolsets_override if toolsets_override is not None
-                            else getattr(agent, "enabled_toolsets", None),
-        "disabled_toolsets": None if toolsets_override is not None
-                             else getattr(agent, "disabled_toolsets", None),
-        "skip_memory": True,
+        "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
+        "disabled_toolsets": getattr(agent, "disabled_toolsets", None), "skip_memory": True,
     }
     if isinstance(rt.get("max_tokens"), int):
         kwargs["max_tokens"] = rt["max_tokens"]
@@ -888,7 +999,6 @@ def _fork_init_kwargs(
 def build_cache_parity_fork(
     agent: Any, task_cfg: Optional[Dict[str, Any]] = None, *, max_iterations: int,
     write_origin: str = "background_review",
-    toolsets_override: Optional[List[str]] = None,
 ) -> Tuple[Any, Dict[str, Any], bool]:
     """Construct a detached AIAgent fork with warm prompt-cache parity (shared with ``/btw``): same
     runtime/credentials as the parent, byte-identical system prompt / tools[] / reasoning config on
@@ -902,8 +1012,7 @@ def build_cache_parity_fork(
     # OAuth-only providers, session-scoped creds and credential pools.
     _rt = _resolve_review_runtime(agent, task_cfg)
     _routed = bool(_rt.get("routed"))
-    review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations,
-                                               toolsets_override=toolsets_override))
+    review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations))
     review_agent._memory_write_origin = review_agent._memory_write_context = write_origin
     review_agent._memory_store = agent._memory_store
     review_agent._memory_enabled = agent._memory_enabled
@@ -1038,57 +1147,60 @@ def _release_fork_clients(review_agent: Any) -> None:
 def _run_review_fork(
     agent: Any, messages_snapshot: List[Dict], prompt: str, task_cfg: Optional[Dict[str, Any]],
     review_run: Optional[_BackgroundReviewRun], st: _ReviewForkState,
-    mode: str = "memory_skills",
+    review_reflect: bool = False,
 ) -> None:
     """Fork phase (inside thread-scoped silence): build the fork, run the prompt under the tool
     whitelist, snapshot its messages/usage, release its clients. Partial progress lands on ``st``
     so the caller's error path still sees usage and the fork to clean up.
 
-    ``mode`` selects the review axis: ``"memory_skills"`` (default, cache-parity
-    fork) or ``"reflect"`` (reflect & distill axis on the ``["reflect"]`` toolset —
-    intentionally bypasses prefix-cache parity; niche axis, infrequent)."""
-    _reflect = mode == "reflect"
+    ``review_reflect`` adds the reflect+distill axis (W5.2 ReflectMemoryShim):
+    the fork keeps full cache parity and gains exactly ``honcho_conclude`` +
+    ``self_reflect`` via a duck-typed memory-manager shim installed AFTER fork
+    creation (skip_memory=True keeps provider lifecycle closed)."""
     st.review_agent, _rt, _routed = build_cache_parity_fork(
         agent, task_cfg, max_iterations=_REVIEW_MAX_ITERATIONS,
-        write_origin="background_reflect" if _reflect else "background_review",
-        toolsets_override=["reflect"] if _reflect else None,
+        write_origin="background_reflect" if review_reflect else "background_review",
     )
+    st.review_agent._reflect_nudge_interval = 0
+    if review_reflect:
+        # Install the shim AFTER fork creation (skip_memory=True means
+        # _memory_manager is None; the shim gives the fork exactly
+        # honcho_conclude + self_reflect without reopening provider lifecycle).
+        st.review_agent._memory_manager = ReflectMemoryShim(
+            parent_memory_manager=getattr(agent, "_memory_manager", None),
+            parent_agent=agent,
+        )
+        with suppress(Exception):
+            from agent.memory_manager import inject_memory_provider_tools
+            inject_memory_provider_tools(st.review_agent)
     _track_review_fork(agent, st.review_agent, register=True)
     from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
-    _honcho_cleanup = None
-    if _reflect:
-        review_whitelist = {"append_reflection", "record_fact"}
-        deny_fmt = (
-            "Background reflect denied non-whitelisted tool: {tool_name}. "
-            "Allowed here: append_reflection and record_fact only. Do not retry {tool_name}."
-        )
-        restriction_msg = (
-            "\n\nYou can only call append_reflection and record_fact. "
-            "Other tools will be denied at runtime — do not attempt them."
-        )
-        # Hand the parent's live Honcho provider to the reflect fork via
-        # thread-local so record_fact can create_conclusion directly
-        # (skip_memory=True keeps ingestion side effects isolated).
-        from tools.reflect_tool import set_reflect_honcho_provider, clear_reflect_honcho_provider
-        set_reflect_honcho_provider(_find_honcho_provider(agent))
-        _honcho_cleanup = clear_reflect_honcho_provider
-    else:
-        review_whitelist, configured_extra_tools = _review_tool_whitelist(st.review_agent, task_cfg)
-        extra_list = ", ".join(sorted(configured_extra_tools))
-        deny_extra = f" Configured extra tools also allowed: {extra_list}." if configured_extra_tools else ""
-        prompt_extra = f" Exception — these configured tools are also allowed: {extra_list}." if configured_extra_tools else ""
-        deny_fmt = (
+    review_whitelist, configured_extra_tools = _review_tool_whitelist(st.review_agent, task_cfg)
+    if review_reflect:
+        review_whitelist = set(review_whitelist) | {"honcho_conclude", "self_reflect"}
+    extra_list = ", ".join(sorted(configured_extra_tools))
+    deny_extra = f" Configured extra tools also allowed: {extra_list}." if configured_extra_tools else ""
+    prompt_extra = f" Exception — these configured tools are also allowed: {extra_list}." if configured_extra_tools else ""
+    _reflect_extra = " honcho_conclude and self_reflect are also allowed." if review_reflect else ""
+    set_thread_tool_whitelist(
+        review_whitelist,
+        deny_msg_fmt=(
             "Background review denied non-whitelisted tool: "
             "{tool_name}. Allowed here: skill_view/skills_list/read_file/search_files to read, "
             "skill_manage(action='patch'|...) to change skills, and "
-            "memory for notes." + deny_extra + " Do not retry {tool_name}."
-        )
-        restriction_msg = (
-            "\n\nYou can only call memory and skill "
-            "management tools. Other tools will be denied "
-            "at runtime — do not attempt them." + prompt_extra
-        )
-    set_thread_tool_whitelist(review_whitelist, deny_msg_fmt=deny_fmt)
+            "memory for notes." + _reflect_extra + deny_extra + " Do not retry {tool_name}."
+        ),
+    )
+    _allowed_tools_msg = (
+        "\n\nYou can only call memory, skill management, honcho_conclude, "
+        "and self_reflect tools. Other tools will be denied at runtime "
+        "— do not attempt them." + prompt_extra
+        if review_reflect
+        else
+        "\n\nYou can only call memory and skill "
+        "management tools. Other tools will be denied "
+        "at runtime — do not attempt them." + prompt_extra
+    )
     with suppress(Exception):
         from tools.skill_manager_guards import _reset_background_review_read_marks
 
@@ -1097,14 +1209,11 @@ def _run_review_fork(
         if review_run is None or review_run.begin_request(st.review_agent):
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
             st.review_agent.run_conversation(
-                user_message=prompt + restriction_msg,
+                user_message=prompt + _allowed_tools_msg,
                 conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
             )
     finally:
         clear_thread_tool_whitelist()
-        if _honcho_cleanup is not None:
-            with suppress(Exception):
-                _honcho_cleanup()
         # Attribute usage to the PARENT session. Snapshot BEFORE unregister/close so counters
         # survive teardown, and in this finally so a fork that consumed tokens then raised is
         # still attributed. The recorder never raises.
@@ -1131,7 +1240,7 @@ def _publish_review_summary(agent: Any, actions: List[str]) -> None:
 def _run_review_in_thread(
     agent: Any, messages_snapshot: List[Dict], prompt: str,
     task_cfg: Optional[Dict[str, Any]] = None, review_run: Optional[_BackgroundReviewRun] = None,
-    mode: str = "memory_skills",
+    review_reflect: bool = False,
 ) -> None:
     """Daemon-thread worker: build the fork, run the prompt, surface the action summary via
     ``agent._safe_print`` / ``background_review_callback``. ``review_run`` (from
@@ -1166,7 +1275,8 @@ def _run_review_in_thread(
         # their console output (#55769 / #55925). ``thread_scoped_silence`` routes only this thread's writes
         # to devnull and leaves all other threads on the real streams.
         with thread_scoped_silence():
-            _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st, mode=mode)
+            _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st,
+                             review_reflect=review_reflect)
         # A buggy/legacy tool response shape must NOT take down the whole review (the outer
         # except would discard every action the fork DID complete), so coerce to an empty list.
         try:
@@ -1230,23 +1340,16 @@ def spawn_background_review_thread(
     to the chosen prompt; automatic reviews pass ``None``. ``task_cfg`` is the pre-loaded
     ``auxiliary.background_review`` block; when omitted it is read once here.
 
-    When ``review_reflect=True`` the reflect-distill axis is selected (independent
-    of the memory/skills axes). Only one axis per call is supported; the caller
-    spawns separate threads for reflect vs. memory/skills."""
+    ``review_reflect`` adds the reflect+distill axis: the fork will extract durable
+    world/people facts (→ honcho_conclude) and write first-person self-reflections
+    (→ self_reflect / SELF.md). When review_reflect=False the behaviour is
+    byte-identical to the pre-W5.2 implementation.
+
+    Composition strategy: reflect instructions are appended to the chosen base
+    prompt (memory / skills / combined) rather than spawning a separate thread,
+    keeping latency impact zero for the common case where reflect fires alone."""
     if task_cfg is None:
         task_cfg = _background_review_task_config()
-
-    if review_reflect:
-        prompt = getattr(agent, "_REFLECT_DISTILL_PROMPT", _REFLECT_DISTILL_PROMPT)
-
-        def _reflect_target() -> None:
-            _run_review_in_thread(
-                agent, messages_snapshot, prompt,
-                task_cfg=task_cfg, review_run=review_run, mode="reflect",
-            )
-
-        return _reflect_target, prompt
-
     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
     prompt = getattr(agent, name, globals()[name])
@@ -1255,15 +1358,51 @@ def spawn_background_review_thread(
             f"{prompt}\n\nThe user explicitly requested this review with the following "
             f"focus — prioritize it over the general instructions above:\n{focus}"
         )
+    # When reflect is the ONLY active axis (no memory/skills), use the dedicated
+    # prompt; when combined, append reflect instructions to the base prompt.
+    if review_reflect:
+        reflect_prompt = getattr(agent, "_REFLECT_DISTILL_PROMPT", _REFLECT_DISTILL_PROMPT)
+        if review_memory or review_skills:
+            prompt = prompt + "\n\n---\n\n" + reflect_prompt
+        else:
+            prompt = reflect_prompt
 
     def _target() -> None:  # resolves _run_review_in_thread at call time (tests patch it)
-        _run_review_in_thread(agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run)
+        _run_review_in_thread(agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run,
+                              review_reflect=review_reflect)
 
     return _target, prompt
 
 
+def maybe_spawn_session_end_reflect(agent: Any, messages_snapshot: List[Dict]) -> bool:
+    """Fire a final reflect review at a genuine session boundary if turns have
+    accumulated since the last reflect dispatch.  Best-effort; never raises.
+
+    Wired into AIAgent.commit_memory_session (session rotation: /new, context
+    compression) — NOT shutdown_memory_provider, where the daemon fork cannot
+    finish before process exit.  Resets the counter so a subsequent interval
+    fire on the same accumulated turns is suppressed.
+    """
+    if not getattr(agent, "_reflect_nudge_interval", 0):
+        return False
+    if getattr(agent, "_turns_since_reflect", 0) <= 0:
+        return False
+    if not messages_snapshot:
+        return False
+    try:
+        agent._spawn_background_review(
+            messages_snapshot=list(messages_snapshot),
+            review_reflect=True,
+        )
+        agent._turns_since_reflect = 0
+        return True
+    except Exception:
+        return False
+
+
 __all__ = [
     "_MEMORY_REVIEW_PROMPT", "_SKILL_REVIEW_PROMPT", "_COMBINED_REVIEW_PROMPT", "_REFLECT_DISTILL_PROMPT",
+    "ReflectMemoryShim", "maybe_spawn_session_end_reflect",
     "load_background_review_settings",
     "spawn_background_review_thread", "summarize_background_review_actions", "build_memory_write_metadata",
 ]

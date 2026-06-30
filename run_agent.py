@@ -784,40 +784,28 @@ class AIAgent(
         )
         from tools.thread_context import propagate_context_to_thread
 
-        # bg-review spawns for every legacy call shape (incl. /refine with both flags False);
-        # it is skipped only when the ONLY requested axis is reflect.
-        if review_memory or review_skills or focus is not None or not review_reflect:
-            review_run = prepare_background_review_run(self)
-            if review_run is None:
-                return
-            try:
-                target, _prompt = spawn_background_review_thread(
-                    self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
-                    focus=focus, task_cfg=task_cfg, review_run=review_run,
-                )
-
-                def _target_with_requeue() -> None:
-                    target()
-                    self._maybe_requeue_preempted_review(review_run, dict(
-                        messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
-                        focus=focus, task_cfg=task_cfg, _requeue_attempts=_requeue_attempts + 1))
-
-                # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
-                # right profile.
-                threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
-            except Exception:
-                finish_background_review_run(self, review_run)
-                raise
-
-        if review_reflect:
-            # No run token: the single-flight _background_review_run slot belongs to the
-            # memory/skills axis; taking it here would stop the two axes from co-firing.
-            # The reflect fork is short, whitelisted to two tools, and safe to let finish.
-            reflect_target, _rprompt = spawn_background_review_thread(
-                self, messages_snapshot, task_cfg=task_cfg, review_run=None,
-                review_reflect=True,
+        review_run = prepare_background_review_run(self)
+        if review_run is None:
+            return
+        try:
+            target, _prompt = spawn_background_review_thread(
+                self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
+                focus=focus, task_cfg=task_cfg, review_run=review_run, review_reflect=review_reflect,
             )
-            threading.Thread(target=propagate_context_to_thread(reflect_target), daemon=True, name="bg-reflect").start()
+
+            def _target_with_requeue() -> None:
+                target()
+                self._maybe_requeue_preempted_review(review_run, dict(
+                    messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,
+                    focus=focus, task_cfg=task_cfg, review_reflect=review_reflect,
+                    _requeue_attempts=_requeue_attempts + 1))
+
+            # Carry the active profile into the review thread so MEMORY.md / skill / reflect
+            # writes land in the right profile.
+            threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
+        except Exception:
+            finish_background_review_run(self, review_run)
+            raise
 
     _REVIEW_REQUEUE_MAX_ATTEMPTS = 3
 
@@ -878,6 +866,11 @@ class AIAgent(
     def commit_memory_session(self, messages: list = None) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
         down."""
+        try:
+            from agent.background_review import maybe_spawn_session_end_reflect
+            maybe_spawn_session_end_reflect(self, messages or [])
+        except Exception:
+            pass
         if self._memory_manager:
             _quietly(lambda: self._memory_manager.on_session_end(messages or []))
         _notify_context_engine_session_end(self, messages)

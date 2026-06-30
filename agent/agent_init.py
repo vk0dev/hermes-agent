@@ -1238,6 +1238,8 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
+    agent._reflect_nudge_interval = 10
+    agent._turns_since_reflect = 0
     agent._iters_since_skill = 0
     # skip_memory skips the external *provider*; enabled_toolsets=["memory"] still gets the
     # built-in store so the memory tool never sees store=None.
@@ -1261,6 +1263,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                 _agent_cfg
             )
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+            agent._reflect_nudge_interval = int(mem_config.get("reflect_nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
@@ -1307,12 +1310,6 @@ def _apply_agent_section(agent, _agent_cfg):
     agent._skill_nudge_interval = 10
     with suppress(Exception):
         agent._skill_nudge_interval = int(_agent_cfg.get("skills", {}).get("creation_nudge_interval", 10))
-
-    # Reflect-distill axis: turn-based cadence (0 = disabled)
-    agent._reflect_nudge_interval = 15
-    agent._turns_since_reflect = 0
-    with suppress(Exception):
-        agent._reflect_nudge_interval = int((_agent_cfg.get("reflect", {}) or {}).get("nudge_interval", 15))
 
     _agent_section = _cfg_dict(_agent_cfg, "agent")
     agent.budget_warning_ratio = normalize_budget_warning_ratio(
