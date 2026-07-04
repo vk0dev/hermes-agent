@@ -36,6 +36,22 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# ── Import-time HERMES_HOME isolation ───────────────────────────────────────
+# The per-test fixture (below) monkeypatches HERMES_HOME, but module IMPORTS
+# run during collection, BEFORE any fixture. `import cli` executes
+# setup_logging(mode="cli") at module level, which resolves get_hermes_home()
+# right then — with the developer's real HERMES_HOME. Result: every test run
+# appended log lines to the real ~/.hermes/logs/agent.log, polluting
+# production monitoring (token-usage.py counted pytest's fake "test-model" /
+# "paid-model-2" calls as paid fallback and told vk to investigate).
+# Point HERMES_HOME at a per-process tempdir NOW, at conftest import time,
+# so import-time side effects land in a sandbox. Per-test fixtures still
+# re-point it to per-test tempdirs afterwards.
+import tempfile as _tempfile
+
+_IMPORT_TIME_HOME = _tempfile.mkdtemp(prefix="hermes-test-home-")
+os.environ["HERMES_HOME"] = _IMPORT_TIME_HOME
+
 
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
