@@ -609,6 +609,19 @@ _single_query_finalize_attempted_session_ids: set[str | None] = set()
 # the handed-off session.
 _handed_off_session_ids: set[str | None] = set()
 _active_agent_ref = None  # active AIAgent, for memory-provider shutdown at exit
+
+
+def _set_active_agent_ref(agent) -> None:
+    """Register the interactive session's agent for atexit cleanup.
+
+    Must be called by whoever constructs the CLI agent (CLIAgentSetupMixin).
+    _run_cleanup reads ``cli._active_agent_ref`` for the session-end reflect
+    flush and memory-provider shutdown; a bare ``global`` assignment in
+    another module sets that module's namespace instead and leaves this one
+    permanently None (bug shipped in the Phase-4 god-file extraction).
+    """
+    global _active_agent_ref
+    _active_agent_ref = agent
 _deferred_agent_startup_done = False
 # Set once the TUI app starts (focus reporting + mouse tracking on); gates the on-exit
 # terminal reset so non-TUI one-shot runs never emit codes for modes they never enabled.

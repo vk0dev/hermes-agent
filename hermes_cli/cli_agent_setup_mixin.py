@@ -548,14 +548,12 @@ class CLIAgentSetupMixin:
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
                 notice_callback=self._on_notice, notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction)
-            # Reference for atexit memory-provider shutdown: ``_run_cleanup`` in cli.py
-            # reads ``cli._active_agent_ref``, so this MUST write the ``cli`` module's
-            # global — a ``global`` statement here would bind this module's namespace.
-            # When this code lived in cli.py a bare ``global _active_agent_ref`` worked; after the god-file
-            # extraction into this mixin a ``global`` here would bind *this module's* namespace, leaving
-            # ``cli._active_agent_ref`` None forever — so memory shutdown never ran on /exit (#49287).
-            import cli as _cli
-            _cli._active_agent_ref = self.agent
+            # Store reference for atexit reflect flush + memory provider
+            # shutdown — must land on the cli module, where _run_cleanup
+            # reads it (a bare `global` here would set this mixin module's
+            # namespace and nothing would ever see the agent; #49287).
+            from cli import _set_active_agent_ref
+            _set_active_agent_ref(self.agent)
             # Route agent status output through prompt_toolkit so ANSI escapes
             # aren't garbled by patch_stdout's StdoutProxy.
             # See #2262.
