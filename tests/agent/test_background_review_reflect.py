@@ -732,6 +732,36 @@ def test_session_end_reflect_no_join_by_default():
     review_thread.join.assert_not_called()
 
 
+def test_set_active_agent_ref_feeds_run_cleanup(monkeypatch):
+    """_set_active_agent_ref must land on cli's module global — the exact
+    regression from the Phase-4 mixin extraction: a bare `global` in the
+    mixin module left cli._active_agent_ref None forever, so the atexit
+    reflect flush and memory shutdown never ran for interactive sessions.
+    """
+    import cli as _cli
+    from unittest.mock import MagicMock
+
+    review_thread = MagicMock()
+    agent = MagicMock()
+    agent._reflect_nudge_interval = 5
+    agent._turns_since_reflect = 3
+    agent._session_messages = [{"role": "user", "content": "hello"}]
+    agent._spawn_background_review = MagicMock(return_value=review_thread)
+    agent.shutdown_memory_provider = MagicMock()
+
+    monkeypatch.setattr(_cli, "_active_agent_ref", None)
+    monkeypatch.setattr(_cli, "_cleanup_done", False)
+    monkeypatch.setattr(_cli, "_reset_terminal_input_modes_on_exit", lambda: None)
+    monkeypatch.setattr(_cli, "_cleanup_all_terminals", lambda: None)
+    monkeypatch.setattr(_cli, "_cleanup_all_browsers", lambda: None)
+
+    _cli._set_active_agent_ref(agent)  # what CLIAgentSetupMixin calls
+    assert _cli._active_agent_ref is agent
+
+    _cli._run_cleanup(notify_session_finalize=False)
+    assert review_thread.join.call_count == 1
+
+
 def test_cli_run_cleanup_reflect_uses_bounded_join(monkeypatch):
     """_run_cleanup passes a bounded join_timeout (teardown path contract)."""
     import cli as _cli

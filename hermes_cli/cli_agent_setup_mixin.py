@@ -693,14 +693,14 @@ class CLIAgentSetupMixin:
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
                 notice_callback=self._on_notice, notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction)
-            # Reference for atexit memory-provider shutdown: ``_run_cleanup`` in cli.py
-            # reads ``cli._active_agent_ref``, so this MUST write the ``cli`` module's
-            # global — a ``global`` statement here would bind this module's namespace.
-            # When this code lived in cli.py a bare ``global _active_agent_ref`` worked; after the god-file
-            # extraction into this mixin a ``global`` here would bind *this module's* namespace, leaving
-            # ``cli._active_agent_ref`` None forever — so memory shutdown never ran on /exit (#49287).
-            import cli as _cli
-            _cli._active_agent_ref = self.agent
+            # Reference for atexit reflect flush + memory-provider shutdown: ``_run_cleanup`` in
+            # cli.py reads ``cli._active_agent_ref``, so this MUST land on the ``cli`` module's
+            # global — a bare ``global`` here would bind this mixin module's own namespace,
+            # leaving ``cli._active_agent_ref`` None forever (#49287). ``_set_active_agent_ref``
+            # is the documented setter for that global (hermes_cli/AGENTS.md: every
+            # global-writing function stays in cli.py).
+            from cli import _set_active_agent_ref
+            _set_active_agent_ref(self.agent)
             # Seed the agent's once-per-lifecycle auto_load cache with the bytes the preload
             # thread rendered, so the shared prompt path never re-reads config or skill files.
             _auto_result = getattr(self, "_auto_load_skills_result", None)
