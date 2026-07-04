@@ -690,6 +690,74 @@ def test_cli_run_cleanup_skips_reflect_when_no_pending_turns(monkeypatch):
     assert len(spawn_calls) == 0
 
 
+def test_session_end_reflect_joins_thread_when_timeout_given():
+    """join_timeout bound-joins the review thread (CLI teardown path).
+
+    Without the join, the daemon review thread is killed at interpreter
+    teardown before the reflect LLM call completes — the SELF.md write is
+    silently lost (bug found 2026-07-03: SELF.md stayed empty despite the
+    axis firing on every CLI exit).
+    """
+    from agent.background_review import maybe_spawn_session_end_reflect
+    from unittest.mock import MagicMock
+
+    agent = MagicMock()
+    agent._reflect_nudge_interval = 5
+    agent._turns_since_reflect = 3
+    review_thread = MagicMock()
+    agent._spawn_background_review = MagicMock(return_value=review_thread)
+
+    result = maybe_spawn_session_end_reflect(
+        agent, [{"role": "user", "content": "hi"}], join_timeout=45.0
+    )
+
+    assert result is True
+    review_thread.join.assert_called_once_with(timeout=45.0)
+
+
+def test_session_end_reflect_no_join_by_default():
+    """Gateway/long-lived callers stay fire-and-forget: no join without timeout."""
+    from agent.background_review import maybe_spawn_session_end_reflect
+    from unittest.mock import MagicMock
+
+    agent = MagicMock()
+    agent._reflect_nudge_interval = 5
+    agent._turns_since_reflect = 3
+    review_thread = MagicMock()
+    agent._spawn_background_review = MagicMock(return_value=review_thread)
+
+    result = maybe_spawn_session_end_reflect(agent, [{"role": "user", "content": "hi"}])
+
+    assert result is True
+    review_thread.join.assert_not_called()
+
+
+def test_cli_run_cleanup_reflect_uses_bounded_join(monkeypatch):
+    """_run_cleanup passes a bounded join_timeout (teardown path contract)."""
+    import cli as _cli
+    from unittest.mock import MagicMock
+
+    review_thread = MagicMock()
+    agent = MagicMock()
+    agent._reflect_nudge_interval = 5
+    agent._turns_since_reflect = 3
+    agent._session_messages = [{"role": "user", "content": "hello"}]
+    agent._spawn_background_review = MagicMock(return_value=review_thread)
+    agent.shutdown_memory_provider = MagicMock()
+
+    monkeypatch.setattr(_cli, "_active_agent_ref", agent)
+    monkeypatch.setattr(_cli, "_cleanup_done", False)
+    monkeypatch.setattr(_cli, "_reset_terminal_input_modes_on_exit", lambda: None)
+    monkeypatch.setattr(_cli, "_cleanup_all_terminals", lambda: None)
+    monkeypatch.setattr(_cli, "_cleanup_all_browsers", lambda: None)
+
+    _cli._run_cleanup(notify_session_finalize=False)
+
+    assert review_thread.join.call_count == 1
+    _, join_kwargs = review_thread.join.call_args
+    assert 0 < join_kwargs.get("timeout", 0) <= 120
+
+
 # ---------------------------------------------------------------------------
 # 9. Gateway expiry watcher trigger — maybe_flush_reflect_on_idle
 # ---------------------------------------------------------------------------

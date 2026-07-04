@@ -1374,7 +1374,11 @@ def spawn_background_review_thread(
     return _target, prompt
 
 
-def maybe_spawn_session_end_reflect(agent: Any, messages_snapshot: List[Dict]) -> bool:
+def maybe_spawn_session_end_reflect(
+    agent: Any,
+    messages_snapshot: List[Dict],
+    join_timeout: Optional[float] = None,
+) -> bool:
     """Fire a final reflect review at a genuine session boundary if turns have
     accumulated since the last reflect dispatch.  Best-effort; never raises.
 
@@ -1384,6 +1388,12 @@ def maybe_spawn_session_end_reflect(agent: Any, messages_snapshot: List[Dict]) -
 
     Resets the counter so a subsequent interval fire on the same accumulated
     turns is suppressed (de-dup guard: _turns_since_reflect == 0 after fire).
+
+    join_timeout: the review runs on a daemon thread; a caller on the
+    interpreter-teardown path (CLI atexit) MUST pass a bounded timeout to
+    wait for the reflect LLM call, otherwise teardown kills the thread
+    before it writes and the reflection is silently lost.  Long-lived
+    callers (gateway) leave it None — fire-and-forget.
     """
     if not getattr(agent, "_reflect_nudge_interval", 0):
         return False
@@ -1392,11 +1402,13 @@ def maybe_spawn_session_end_reflect(agent: Any, messages_snapshot: List[Dict]) -
     if not messages_snapshot:
         return False
     try:
-        agent._spawn_background_review(
+        review_thread = agent._spawn_background_review(
             messages_snapshot=list(messages_snapshot),
             review_reflect=True,
         )
         agent._turns_since_reflect = 0
+        if join_timeout and hasattr(review_thread, "join"):
+            review_thread.join(timeout=join_timeout)
         return True
     except Exception:
         return False

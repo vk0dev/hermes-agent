@@ -830,7 +830,12 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
             if _active_agent_ref:
                 from agent.background_review import maybe_spawn_session_end_reflect
                 _reflect_msgs = getattr(_active_agent_ref, "_session_messages", None)
-                maybe_spawn_session_end_reflect(_active_agent_ref, _reflect_msgs or [])
+                # Bounded join: this is the interpreter-teardown path — without
+                # it the daemon review thread dies before the reflect LLM call
+                # finishes and the SELF.md write is silently lost.
+                maybe_spawn_session_end_reflect(
+                    _active_agent_ref, _reflect_msgs or [], join_timeout=45.0
+                )
         except Exception:
             pass
         try:
