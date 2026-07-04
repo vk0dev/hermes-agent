@@ -363,6 +363,20 @@ _DO_NOT_CAPTURE_BLOCK = (
     "If a tool failed because of setup state, capture the FIX (install command, config step, env "
     "var to set) under an existing setup or troubleshooting skill — never 'this tool does not "
     "work' as a standalone constraint.\n\n"
+    "  • Per-run session logs disguised as references. NEVER create "
+    "dated per-pass reference files ('<skill>-idle-pass-<timestamp>.md', "
+    "'<topic>-YYYY-MM-DD.md') for routine runs that hit no new problem — "
+    "cron/heartbeat passes especially. A clean scheduled pass is ALWAYS "
+    "'Nothing to save.' (Real incident: hourly heartbeat reviews accreted "
+    "129 near-identical idle-pass reference files and grew one SKILL.md "
+    "past the 100k write limit, breaking every later update.)\n"
+    "  • Duplicate-topic references. Before adding a reference file, "
+    "check the existing references/ list for one covering the same "
+    "topic and EXTEND it in place; do not create a dated sibling "
+    "('cron-safe-logging-2026-06-24.md' next to 'cron-safe-logging.md').\n\n"
+    "Size discipline: if the target SKILL.md is already large (say over "
+    "~30k characters), consolidate or trim while you edit — replace "
+    "overlapping bullets rather than appending near-duplicates.\n\n"
 )
 
 _SKILL_REVIEW_PROMPT = (
