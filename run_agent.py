@@ -786,12 +786,17 @@ class AIAgent(
 
     def _spawn_background_review(self, messages_snapshot: List[Dict], review_memory: bool = False,
                                  review_skills: bool = False, focus: Optional[str] = None, explicit: bool = False,
-                                 review_reflect: bool = False) -> None:
+                                 review_reflect: bool = False) -> "Optional[threading.Thread]":
         """Post-turn review entry point: decide WHEN, then spawn.
 
         A review whose runtime is the MANAGED LOCAL llama-server is queued for machine idle (``defer: auto``)
         instead of hitting the user's GPU mid-session; everything else spawns immediately. ``explicit``
         (/refine) is never deferred but does not touch the ``focus``-keyed delegate/enabled gates.
+
+        Returns the started thread (None when gated/deferred) so session-boundary
+        callers (CLI atexit) can bound-join it: a daemon thread spawned during
+        interpreter teardown is killed before the reflect LLM call completes,
+        silently losing the SELF.md write.
         """
         # Gates run at enqueue/spawn time; the idle dispatcher re-checks `enabled` at dispatch time.
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
@@ -814,13 +819,13 @@ class AIAgent(
         if focus is None and not explicit and _review_should_defer(self, task_cfg):
             from agent.review_idle_queue import QUEUE
             QUEUE.enqueue(self, _review_queue_key(self), kwargs)
-            return
-        self._spawn_background_review_now(**kwargs)
+            return None
+        return self._spawn_background_review_now(**kwargs)
 
     def _spawn_background_review_now(self, messages_snapshot: List[Dict], review_memory: bool = False,
                                      review_skills: bool = False, focus: Optional[str] = None,
                                      task_cfg: Optional[Dict[str, Any]] = None, _requeue_attempts: int = 0,
-                                     explicit: bool = False, review_reflect: bool = False) -> None:
+                                     explicit: bool = False, review_reflect: bool = False) -> "Optional[threading.Thread]":
         """Spawn the background memory/skill/reflect review thread(s).
 
         ``threading.Thread`` is constructed here so tests patching ``run_agent.threading.Thread`` keep working.
@@ -830,18 +835,24 @@ class AIAgent(
         A deferred review preempted by a live turn is requeued (bounded) rather than lost.
         The reflect axis runs in its own ``bg-reflect`` thread independent of the memory/skills
         ``bg-review`` thread so both can co-fire.
+
+        Returns the started thread (the reflect thread when that axis fired, otherwise the
+        memory/skills thread; ``None`` when gated/deferred/refused) so session-boundary callers
+        (CLI atexit) can bound-join it: a daemon thread spawned during interpreter teardown is
+        killed before the reflect LLM call completes, silently losing the SELF.md write.
         """
         from agent.background_review import (
             finish_background_review_run, prepare_background_review_run, spawn_background_review_thread,
         )
         from tools.thread_context import propagate_context_to_thread
 
+        review_thread: "Optional[threading.Thread]" = None
         # bg-review spawns for every legacy call shape (incl. /refine with both flags False);
         # it is skipped only when the ONLY requested axis is reflect.
         if review_memory or review_skills or focus is not None or not review_reflect:
             review_run = prepare_background_review_run(self)
             if review_run is None:
-                return
+                return None
             try:
                 target, _prompt = spawn_background_review_thread(
                     self, messages_snapshot, review_memory=review_memory, review_skills=review_skills,
@@ -857,7 +868,9 @@ class AIAgent(
 
                 # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
                 # right profile.
-                threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
+                review_thread = threading.Thread(
+                    target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review")
+                review_thread.start()
             except Exception:
                 finish_background_review_run(self, review_run)
                 raise
@@ -870,7 +883,11 @@ class AIAgent(
                 self, messages_snapshot, task_cfg=task_cfg, review_run=None,
                 review_reflect=True,
             )
-            threading.Thread(target=propagate_context_to_thread(reflect_target), daemon=True, name="bg-reflect").start()
+            review_thread = threading.Thread(
+                target=propagate_context_to_thread(reflect_target), daemon=True, name="bg-reflect")
+            review_thread.start()
+
+        return review_thread
 
     _REVIEW_REQUEUE_MAX_ATTEMPTS = 3
 
