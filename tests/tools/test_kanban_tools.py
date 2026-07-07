@@ -135,6 +135,245 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_metadata_round_trips_through_show(worker_env):
+    """Structured completion metadata should be visible to downstream agents."""
+    from tools import kanban_tools as kt
+
+    handoff = {
+        "changed_files": ["hermes_cli/kanban.py"],
+        "verification": ["pytest tests/tools/test_kanban_tools.py -q"],
+        "dependencies": [],
+        "blocked_reason": None,
+        "retry_notes": "none",
+        "residual_risk": ["dashboard rendering not exercised"],
+    }
+
+    complete_out = kt._handle_complete({
+        "summary": "finished with structured evidence",
+        "metadata": handoff,
+    })
+    assert json.loads(complete_out)["ok"] is True
+
+    show_out = kt._handle_show({"task_id": worker_env})
+    shown = json.loads(show_out)
+    assert shown["task"]["status"] == "done"
+    assert shown["runs"][-1]["summary"] == "finished with structured evidence"
+    assert shown["runs"][-1]["metadata"] == handoff
+
+
+def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-trusted")
+    metadata = {"files": 2, "worker_session_id": "user-spoof"}
+
+    out = kt._handle_complete({
+        "summary": "done by scoped worker",
+        "metadata": metadata,
+    })
+    assert json.loads(out)["ok"] is True
+    assert metadata["worker_session_id"] == "user-spoof"
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.metadata == {
+            "files": 2,
+            "worker_session_id": "session-trusted",
+        }
+    finally:
+        conn.close()
+
+
+def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
+    monkeypatch, worker_env
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-trusted")
+
+    out = kt._handle_complete({
+        "task_id": worker_env,
+        "summary": "done outside worker scope",
+        "metadata": {"files": 2, "worker_session_id": "user-provided"},
+    })
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.metadata == {
+            "files": 2,
+            "worker_session_id": "user-provided",
+        }
+    finally:
+        conn.close()
+
+
+def test_complete_with_result_only(worker_env):
+    """`result` alone (without summary) is accepted for legacy compat."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"result": "legacy result"})
+    d = json.loads(out)
+    assert d["ok"] is True
+
+
+def test_complete_rejects_missing_and_whitespace_summary(worker_env):
+    """No artifact = no done. Whitespace-only summary is truthy but strips to
+    nothing downstream — it produced a false-done with summary=None
+    (incident t_862e75b2 run 333) and must be rejected up front."""
+    from tools import kanban_tools as kt
+    for payload in (
+        {},
+        {"summary": "   "},
+        {"summary": "\n\t"},
+        {"summary": " ", "result": "  "},
+    ):
+        d = json.loads(kt._handle_complete(dict(payload)))
+        assert d.get("ok") is not True, f"payload {payload!r} must be rejected"
+        assert "provide at least one of" in json.dumps(d)
+    # The task must still be completable afterwards with a real summary.
+    d = json.loads(kt._handle_complete({"summary": "real artifact"}))
+    assert d["ok"] is True
+
+
+def test_complete_with_artifacts_lands_in_event_payload(worker_env):
+    """``artifacts=[...]`` rides into the completed event payload so the
+    gateway notifier can upload them as native attachments. See the
+    kanban notifier in gateway/run.py for the consumer side."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "rendered the chart",
+        "artifacts": ["/tmp/q3-revenue.png", "/tmp/q3-report.pdf"],
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        events = kb.list_events(conn, worker_env)
+        # Find the completion event
+        completed = [e for e in events if e.kind == "completed"]
+        assert len(completed) == 1
+        payload = completed[0].payload or {}
+        assert payload.get("artifacts") == [
+            "/tmp/q3-revenue.png",
+            "/tmp/q3-report.pdf",
+        ]
+        # And the artifacts also live on metadata for downstream workers
+        run = kb.latest_run(conn, worker_env)
+        assert run.metadata.get("artifacts") == [
+            "/tmp/q3-revenue.png",
+            "/tmp/q3-report.pdf",
+        ]
+    finally:
+        conn.close()
+
+
+def test_complete_artifacts_accepts_single_string(worker_env):
+    """A bare string is auto-promoted to a single-element list for convenience."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "one chart",
+        "artifacts": "/tmp/chart.png",
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.metadata.get("artifacts") == ["/tmp/chart.png"]
+    finally:
+        conn.close()
+
+
+def test_complete_artifacts_merges_with_explicit_metadata_field(worker_env):
+    """If the worker passes metadata.artifacts AND the top-level artifacts
+    param, merge the two without duplicates."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "merged",
+        "metadata": {"artifacts": ["/tmp/a.png"], "other": "fact"},
+        "artifacts": ["/tmp/b.pdf", "/tmp/a.png"],
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        # Order: existing entries first, then new ones, deduplicated.
+        assert run.metadata.get("artifacts") == ["/tmp/a.png", "/tmp/b.pdf"]
+        assert run.metadata.get("other") == "fact"
+    finally:
+        conn.close()
+
+
+def test_complete_rejects_non_list_artifacts(worker_env):
+    """Non-list, non-string artifacts should be rejected with a clear error."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "bad shape",
+        "artifacts": {"not": "a list"},
+    })
+    err = json.loads(out).get("error", "")
+    assert "artifacts must be a list" in err
+
+
+def test_complete_rejects_no_handoff(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({})
+    assert json.loads(out).get("error"), "should have errored"
+
+
+def test_complete_rejects_non_dict_metadata(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "x", "metadata": [1, 2, 3]})
+    assert json.loads(out).get("error")
+
+
+def test_complete_phantom_card_message_advertises_retry(worker_env):
+    """A phantom-card rejection must surface a tool_error that explicitly
+    tells the worker the task is still in-flight and how to retry — the
+    worker has no other channel to discover that. Regression for #22923,
+    where the previous wording read like a terminal failure and workers
+    routinely abandoned the run instead of trying again.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "oops claimed a phantom",
+        "created_cards": ["t_phantomdeadbeef"],
+    })
+    err = json.loads(out).get("error", "")
+    assert err, f"expected an error, got {out!r}"
+    # Phantom id surfaced verbatim.
+    assert "t_phantomdeadbeef" in err
+    # The retry-is-supported phrasing — these are the literal cues a
+    # worker reads to decide whether to retry vs block/abandon. If a
+    # future change rewords the message, these checks will catch the
+    # regression. See #22923 for the failure mode.
+    assert "still in-flight" in err
+    assert "Retry kanban_complete" in err
+    assert "created_cards=[]" in err
+
+    # Critically: the task is genuinely still in-flight — the gate
+    # rejection did not mutate state, so the worker's retry can land.
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
