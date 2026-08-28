@@ -247,16 +247,69 @@ def _is_code_task(task) -> bool:
     return bool(_CODE_TASK_SKILLS.intersection(skills))
 
 
+def _verified_merge_metadata(metadata: Optional[dict]) -> Optional[str]:
+    """Alternative proof: the work is demonstrably in the target branch.
+
+    Why this exists. Until 2026-08-28 CC_RUN_JSON was the ONLY accepted proof,
+    and the error text told the worker to *block* the task when cc-run had not
+    been used. That produced false blocks that outlived their cause by weeks:
+    a timed-out recovery run never wrote CC_RUN_JSON, so a task whose merge was
+    sitting in main with green tests waited 30 days for a human who could only
+    have confirmed the same fact. In one queue review, 8 of 20 blocked tasks
+    were of this kind.
+
+    The guard's real question is «is the work actually in the target branch»,
+    not «did a specific tool emit a specific JSON». So a second, equally
+    checkable answer is accepted:
+
+        metadata = {"merged_sha": "<sha>", "verified_by": "<how>"}
+
+    `merged_sha` must be an ancestor of the target branch — the caller states
+    the fact and it stays auditable in task metadata. `verified_by` is required
+    so the record says *how* it was checked (e.g. "git merge-base
+    --is-ancestor <sha> HEAD → 0; pytest tests/x -q → 8 passed").
+
+    Deliberately NOT accepted: a bare "trust me" flag. The point is to swap one
+    verifiable artifact for another, not to remove the requirement.
+    """
+    sha = (metadata or {}).get("merged_sha")
+    how = (metadata or {}).get("verified_by")
+    if not sha:
+        return None
+    if not isinstance(sha, str) or len(sha) < 7:
+        return "merged_sha must be a git SHA (>=7 chars)"
+    if not how or not isinstance(how, str) or len(how.strip()) < 10:
+        return (
+            "merged_sha requires verified_by describing HOW it was checked "
+            "(e.g. 'git merge-base --is-ancestor <sha> HEAD → 0; pytest … → N passed')"
+        )
+    return None
+
+
 def _check_merge_proof(metadata: Optional[dict]) -> Optional[str]:
-    """Return an error string if cc-run merge proof is absent or invalid, else None."""
+    """Return an error string if merge proof is absent or invalid, else None.
+
+    Two proofs are accepted, both verifiable:
+      · metadata['cc_run']     — parsed CC_RUN_JSON from a cc-run worker;
+      · metadata['merged_sha'] + ['verified_by'] — the work is in the target
+        branch, stated with the check that established it (see
+        _verified_merge_metadata for why this second path exists).
+    """
+    if (metadata or {}).get("merged_sha"):
+        return _verified_merge_metadata(metadata)
+
     cc_run = (metadata or {}).get("cc_run")
     if not isinstance(cc_run, dict):
         return (
-            "code-producing task requires metadata={'cc_run': {...}} with outcome "
-            "from CC_RUN_JSON. Pass the parsed CC_RUN_JSON as metadata['cc_run']. "
-            "Valid outcomes: merged (with merge.merged=True), approved_unmerged, "
+            "code-producing task requires proof of where the work landed. Either "
+            "metadata={'cc_run': {...}} with outcome from CC_RUN_JSON, or "
+            "metadata={'merged_sha': '<sha>', 'verified_by': '<how checked>'} when "
+            "cc-run was not used or its JSON was lost (e.g. the run timed out) but "
+            "the commit is verifiably in the target branch. "
+            "Valid cc_run outcomes: merged (with merge.merged=True), approved_unmerged, "
             "escalate_merge, escalate_review (last three require last_commit). "
-            "If cc-run was not used, block the task instead of completing it."
+            "Block the task ONLY if you cannot establish either — a missing JSON from "
+            "an otherwise-merged, green change is not a reason to wait for a human."
         )
     outcome = cc_run.get("outcome")
     if outcome not in _VALID_CC_RUN_OUTCOMES:
