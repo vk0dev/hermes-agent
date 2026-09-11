@@ -625,6 +625,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
         "WHERE status = 'running' "
+        "  AND (claim_kind IS NULL OR claim_kind != 'external') "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
@@ -643,6 +644,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
+                "  AND (claim_kind IS NULL OR claim_kind != 'external') "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
                 (tid, row["claim_lock"], row["claim_expires"]),
             )
